@@ -86,8 +86,10 @@ jobs:
           cargo llvm-cov --all-features --workspace --summary-only > coverage_summary.txt
           cat coverage_summary.txt
 
-          # Extract line coverage percentage (field 9 in TOTAL row)
-          COVERAGE=$(grep "TOTAL" coverage_summary.txt | awk '{print $9}' | sed 's/%//')
+          # Extract line coverage percentage from TOTAL row
+          # The format is: TOTAL <regions> <missed> <cover%> <funcs> <missed> <cover%> <lines> <missed> <cover%> <branches> <missed> <cover%>
+          # We want the 3rd percentage (Lines Cover), which is field 10
+          COVERAGE=$(grep "TOTAL" coverage_summary.txt | awk '{print $10}' | sed 's/%//')
           echo "Coverage: ${COVERAGE}%"
 
           THRESHOLD=80
