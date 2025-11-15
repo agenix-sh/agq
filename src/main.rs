@@ -40,8 +40,17 @@ async fn main() -> Result<()> {
     // Parse command-line arguments
     let args = Args::parse();
 
-    // Get bind address (CLI overrides env var)
-    let bind_addr = args.bind;
+    // Get bind address (CLI overrides env var, then default)
+    let bind_addr = if args.bind != "127.0.0.1:6379" {
+        // CLI arg was explicitly provided (different from default)
+        args.bind
+    } else if let Ok(addr) = std::env::var("AGQ_BIND_ADDR") {
+        // Use env var if set
+        addr
+    } else {
+        // Use default
+        args.bind
+    };
 
     // Get or generate session key (CLI overrides env var)
     let session_key = if let Some(key_hex) = args.session_key {
@@ -147,5 +156,13 @@ mod tests {
         assert!(result.is_ok());
         let key = result.unwrap();
         assert_eq!(key.len(), 32);
+    }
+
+    #[test]
+    fn test_parse_hex_key_256_bit() {
+        let key_hex = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+        let result = parse_hex_key(key_hex);
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap().len(), 32);
     }
 }
