@@ -82,11 +82,17 @@ jobs:
 
       - name: Check coverage threshold
         run: |
-          COVERAGE=$(cargo llvm-cov --all-features --workspace --summary-only | grep -oP 'TOTAL.*\K[0-9]+\.[0-9]+' | head -1)
+          # Generate coverage summary
+          cargo llvm-cov --all-features --workspace --summary-only > coverage_summary.txt
+          cat coverage_summary.txt
+
+          # Extract coverage percentage (cross-platform compatible)
+          COVERAGE=$(grep "TOTAL" coverage_summary.txt | awk '{print $NF}' | sed 's/%//')
           echo "Coverage: ${COVERAGE}%"
 
           THRESHOLD=80
-          if (( $(echo "$COVERAGE < $THRESHOLD" | bc -l) )); then
+          # Use awk for floating point comparison (bc might not be available)
+          if [ $(echo "$COVERAGE < $THRESHOLD" | awk '{print ($1 < $2)}') -eq 1 ]; then
             echo "❌ Coverage ${COVERAGE}% is below threshold ${THRESHOLD}%"
             exit 1
           fi

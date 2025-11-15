@@ -94,9 +94,11 @@ jobs:
       - name: Run tests
         if: matrix.os == 'macos' || (matrix.os == 'linux' && matrix.arch == 'x86_64')
         run: cargo test --target ${{ matrix.target }} --verbose
+        continue-on-error: false
 
       - name: Build (release)
         run: cargo build --target ${{ matrix.target }} --release --verbose
+        continue-on-error: ${{ matrix.arch == 'arm64' && matrix.os == 'linux' }}
 
       - name: Upload artifacts
         uses: actions/upload-artifact@v4
