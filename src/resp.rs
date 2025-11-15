@@ -234,8 +234,8 @@ impl RespParser {
         }
 
         // Security: Limit array size to prevent DoS
-        let size = usize::try_from(size)
-            .map_err(|_| Error::Protocol("Invalid array size".to_string()))?;
+        let size =
+            usize::try_from(size).map_err(|_| Error::Protocol("Invalid array size".to_string()))?;
         if size > MAX_ARRAY_SIZE {
             return Err(Error::Protocol(format!(
                 "Array size {size} exceeds maximum {MAX_ARRAY_SIZE}"

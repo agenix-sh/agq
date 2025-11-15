@@ -195,7 +195,7 @@ fn handle_auth(
     let RespValue::BulkString(provided_key) = &args[1] else {
         return Err(Error::InvalidArguments(
             "AUTH key must be a bulk string".to_string(),
-        ))
+        ));
     };
 
     // Security: Reject empty keys
@@ -268,8 +268,7 @@ mod tests {
             RespValue::BulkString(b"test_key".to_vec()),
         ];
 
-        let result = handle_auth(&args, &mut authenticated, &session_key)
-            .unwrap();
+        let result = handle_auth(&args, &mut authenticated, &session_key).unwrap();
 
         assert_eq!(result, RespValue::SimpleString("OK".to_string()));
         assert!(authenticated);
