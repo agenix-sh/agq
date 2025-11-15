@@ -1,0 +1,208 @@
+name: PR Checks
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  pr-validation:
+    name: PR Validation
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Check PR title format
+        run: |
+          PR_TITLE="${{ github.event.pull_request.title }}"
+          if [[ ! "$PR_TITLE" =~ ^AGQ-[0-9]+: ]]; then
+            echo "❌ PR title must start with 'AGQ-XXX:' (e.g., 'AGQ-001: Description')"
+            exit 1
+          fi
+          echo "✅ PR title format is correct"
+
+      - name: Check PR description
+        run: |
+          PR_BODY="${{ github.event.pull_request.body }}"
+          if [[ ! "$PR_BODY" =~ "## Issue" ]]; then
+            echo "⚠️  PR description should include '## Issue' section"
+          fi
+          if [[ ! "$PR_BODY" =~ "## Security Review" ]]; then
+            echo "⚠️  PR description should include '## Security Review' section"
+          fi
+          if [[ ! "$PR_BODY" =~ "## Testing" ]]; then
+            echo "⚠️  PR description should include '## Testing' section"
+          fi
+
+  quick-checks:
+    name: Quick Checks
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+
+      - name: Run clippy (fast)
+        run: cargo clippy --all-targets -- -D warnings
+
+      - name: Check Cargo.toml format
+        run: |
+          if ! grep -q "rust-version" Cargo.toml; then
+            echo "⚠️  Cargo.toml should specify rust-version"
+          fi
+
+  test-coverage-check:
+    name: Test Coverage Check
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: llvm-tools-preview
+
+      - name: Install cargo-llvm-cov
+        run: cargo install cargo-llvm-cov --locked
+
+      - name: Generate coverage
+        run: cargo llvm-cov --all-features --workspace --lcov --output-path lcov.info
+
+      - name: Check coverage threshold
+        run: |
+          # Generate coverage summary
+          cargo llvm-cov --all-features --workspace --summary-only > coverage_summary.txt
+          cat coverage_summary.txt
+
+          # Extract line coverage percentage from TOTAL row
+          # The format is: TOTAL <regions> <missed> <cover%> <funcs> <missed> <cover%> <lines> <missed> <cover%> <branches> <missed> <cover%>
+          # We want the 3rd percentage (Lines Cover), which is field 10
+          COVERAGE_RAW=$(grep "TOTAL" coverage_summary.txt | awk '{print $10}')
+          COVERAGE=$(echo "$COVERAGE_RAW" | sed 's/%//')
+
+          echo "Coverage (raw): $COVERAGE_RAW"
+          echo "Coverage (numeric): $COVERAGE"
+
+          THRESHOLD=80
+          # Use awk for floating point comparison
+          RESULT=$(echo "$COVERAGE $THRESHOLD" | awk '{if ($1 < $2) print "FAIL"; else print "PASS"}')
+
+          if [ "$RESULT" = "FAIL" ]; then
+            echo "❌ Coverage ${COVERAGE}% is below threshold ${THRESHOLD}%"
+            exit 1
+          fi
+          echo "✅ Coverage ${COVERAGE}% meets threshold ${THRESHOLD}%"
+
+  security-check:
+    name: Security Check
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install cargo-audit
+        run: cargo install cargo-audit --locked
+
+      - name: Run security audit
+        run: cargo audit
+
+      - name: Check for unsafe code
+        run: |
+          UNSAFE_COUNT=$(grep -r "unsafe" src/ tests/ --include="*.rs" | grep -v "// unsafe" | wc -l)
+          if [ $UNSAFE_COUNT -gt 0 ]; then
+            echo "⚠️  Found $UNSAFE_COUNT unsafe blocks - ensure they are justified"
+            grep -r "unsafe" src/ tests/ --include="*.rs" | grep -v "// unsafe"
+          else
+            echo "✅ No unsafe code blocks found"
+          fi
+
+  dependency-check:
+    name: Dependency Check
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Check dependency tree depth
+        run: |
+          cargo tree --depth 3
+
+      - name: Check for duplicate dependencies
+        run: |
+          DUPLICATES=$(cargo tree --duplicates | wc -l)
+          if [ $DUPLICATES -gt 0 ]; then
+            echo "⚠️  Found duplicate dependencies:"
+            cargo tree --duplicates
+          else
+            echo "✅ No duplicate dependencies"
+          fi
+
+  pr-summary:
+    name: PR Summary
+    runs-on: ubuntu-latest
+    needs: [pr-validation, quick-checks, test-coverage-check, security-check, dependency-check]
+    if: always()
+    steps:
+      - name: Generate summary
+        run: |
+          echo "## PR Check Results" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+
+          if [ "${{ needs.pr-validation.result }}" == "success" ]; then
+            echo "✅ PR Validation: Passed" >> $GITHUB_STEP_SUMMARY
+          else
+            echo "❌ PR Validation: Failed" >> $GITHUB_STEP_SUMMARY
+          fi
+
+          if [ "${{ needs.quick-checks.result }}" == "success" ]; then
+            echo "✅ Quick Checks: Passed" >> $GITHUB_STEP_SUMMARY
+          else
+            echo "❌ Quick Checks: Failed" >> $GITHUB_STEP_SUMMARY
+          fi
+
+          if [ "${{ needs.test-coverage-check.result }}" == "success" ]; then
+            echo "✅ Test Coverage: Passed (≥80%)" >> $GITHUB_STEP_SUMMARY
+          else
+            echo "❌ Test Coverage: Failed (<80%)" >> $GITHUB_STEP_SUMMARY
+          fi
+
+          if [ "${{ needs.security-check.result }}" == "success" ]; then
+            echo "✅ Security Check: Passed" >> $GITHUB_STEP_SUMMARY
+          else
+            echo "❌ Security Check: Failed" >> $GITHUB_STEP_SUMMARY
+          fi
+
+          if [ "${{ needs.dependency-check.result }}" == "success" ]; then
+            echo "✅ Dependency Check: Passed" >> $GITHUB_STEP_SUMMARY
+          else
+            echo "⚠️  Dependency Check: Warnings" >> $GITHUB_STEP_SUMMARY
+          fi
+
+      - name: Check overall status
+        run: |
+          if [ "${{ needs.pr-validation.result }}" != "success" ] || \
+             [ "${{ needs.quick-checks.result }}" != "success" ] || \
+             [ "${{ needs.test-coverage-check.result }}" != "success" ] || \
+             [ "${{ needs.security-check.result }}" != "success" ]; then
+            echo "❌ Some checks failed - PR not ready for merge"
+            exit 1
+          fi
+          echo "✅ All critical checks passed - PR ready for review"
