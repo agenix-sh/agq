@@ -2,9 +2,10 @@
 //!
 //! Main entry point for the AGQ server.
 
-use agq::{Result, Server};
+use agq::{Database, Result, Server};
 use clap::Parser;
 use ring::rand::{SecureRandom, SystemRandom};
+use std::path::PathBuf;
 use tracing::{error, info, warn};
 
 /// AGQ - Queue Manager for the AGX Agentic Ecosystem
@@ -12,6 +13,7 @@ use tracing::{error, info, warn};
 /// Environment variables:
 /// - `AGQ_BIND_ADDR`: Bind address (overridden by --bind)
 /// - `AGQ_SESSION_KEY`: Session key (overridden by --session-key)
+/// - `AGQ_DATA_DIR`: Data directory (overridden by --data-dir)
 #[derive(Parser, Debug)]
 #[command(author, version, about, long_about = None)]
 struct Args {
@@ -23,6 +25,11 @@ struct Args {
     /// If not provided, a secure random key will be generated and displayed
     #[arg(short, long)]
     session_key: Option<String>,
+
+    /// Data directory for database storage
+    /// Defaults to ~/.agq/ if not specified
+    #[arg(short, long)]
+    data_dir: Option<String>,
 }
 
 #[tokio::main]
@@ -52,6 +59,23 @@ async fn main() -> Result<()> {
         args.bind
     };
 
+    // Get data directory (CLI overrides env var, then default to ~/.agq/)
+    let data_dir = if let Some(dir) = args.data_dir {
+        PathBuf::from(dir)
+    } else if let Ok(dir) = std::env::var("AGQ_DATA_DIR") {
+        PathBuf::from(dir)
+    } else {
+        // Default to ~/.agq/
+        let home = std::env::var("HOME")
+            .map_err(|_| agq::Error::Protocol("HOME environment variable not set".to_string()))?;
+        PathBuf::from(home).join(".agq")
+    };
+
+    // Initialize database
+    let db_path = data_dir.join("data.redb");
+    info!("Initializing database at: {}", db_path.display());
+    let db = Database::open(&db_path)?;
+
     // Get or generate session key (CLI overrides env var)
     let session_key = if let Some(key_hex) = args.session_key {
         // Use CLI-provided key
@@ -73,7 +97,7 @@ async fn main() -> Result<()> {
     };
 
     // Create and run server
-    let server = Server::new(&bind_addr, session_key).await?;
+    let server = Server::new(&bind_addr, session_key, db).await?;
     info!("AGQ server started successfully on {}", bind_addr);
 
     if let Err(e) = server.run().await {
