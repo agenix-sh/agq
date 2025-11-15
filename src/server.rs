@@ -2,7 +2,7 @@
 
 use crate::error::{Error, Result};
 use crate::resp::{RespParser, RespValue};
-use crate::storage::{Database, StringOps};
+use crate::storage::{Database, ListOps, StringOps};
 use std::sync::Arc;
 use subtle::ConstantTimeEq;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -134,7 +134,7 @@ async fn handle_connection(
 
         // Process all complete messages
         while let Some(value) = parser.parse()? {
-            match handle_command(value, &mut authenticated, &session_key, &db) {
+            match handle_command(value, &mut authenticated, &session_key, &db).await {
                 Ok(response) => {
                     stream.write_all(&response.encode()).await?;
                 }
@@ -152,7 +152,7 @@ async fn handle_connection(
 /// # Security
 /// - Validates authentication state before executing commands
 /// - Uses constant-time comparison for session keys
-fn handle_command(
+async fn handle_command(
     value: RespValue,
     authenticated: &mut bool,
     session_key: &[u8],
@@ -200,6 +200,36 @@ fn handle_command(
                 return Err(Error::NoAuth);
             }
             handle_exists(&args, db)
+        }
+        "LPUSH" => {
+            if !*authenticated {
+                return Err(Error::NoAuth);
+            }
+            handle_lpush(&args, db)
+        }
+        "RPOP" => {
+            if !*authenticated {
+                return Err(Error::NoAuth);
+            }
+            handle_rpop(&args, db)
+        }
+        "BRPOP" => {
+            if !*authenticated {
+                return Err(Error::NoAuth);
+            }
+            handle_brpop(&args, db).await
+        }
+        "LLEN" => {
+            if !*authenticated {
+                return Err(Error::NoAuth);
+            }
+            handle_llen(&args, db)
+        }
+        "LRANGE" => {
+            if !*authenticated {
+                return Err(Error::NoAuth);
+            }
+            handle_lrange(&args, db)
         }
         _ => {
             if !*authenticated {
@@ -364,6 +394,115 @@ fn handle_exists(args: &[RespValue], db: &Database) -> Result<RespValue> {
     Ok(RespValue::Integer(i64::from(exists)))
 }
 
+/// Handle LPUSH command
+///
+/// Syntax: LPUSH key value
+/// Returns: Integer - length of list after push
+fn handle_lpush(args: &[RespValue], db: &Database) -> Result<RespValue> {
+    if args.len() != 3 {
+        return Err(Error::InvalidArguments(
+            "LPUSH requires exactly two arguments".to_string(),
+        ));
+    }
+
+    let key = args[1].as_string()?;
+    let RespValue::BulkString(value) = &args[2] else {
+        return Err(Error::InvalidArguments(
+            "LPUSH value must be a bulk string".to_string(),
+        ));
+    };
+
+    let length = db.lpush(&key, value)?;
+    Ok(RespValue::Integer(length as i64))
+}
+
+/// Handle RPOP command
+///
+/// Syntax: RPOP key
+/// Returns: Bulk string value or nil if list is empty
+fn handle_rpop(args: &[RespValue], db: &Database) -> Result<RespValue> {
+    if args.len() != 2 {
+        return Err(Error::InvalidArguments(
+            "RPOP requires exactly one argument".to_string(),
+        ));
+    }
+
+    let key = args[1].as_string()?;
+
+    match db.rpop(&key)? {
+        Some(value) => Ok(RespValue::BulkString(value)),
+        None => Ok(RespValue::NullBulkString),
+    }
+}
+
+/// Handle BRPOP command
+///
+/// Syntax: BRPOP key timeout
+/// Returns: Bulk string value or nil if timeout
+async fn handle_brpop(args: &[RespValue], db: &Database) -> Result<RespValue> {
+    if args.len() != 3 {
+        return Err(Error::InvalidArguments(
+            "BRPOP requires exactly two arguments".to_string(),
+        ));
+    }
+
+    let key = args[1].as_string()?;
+    let timeout_str = args[2].as_string()?;
+    let timeout_secs: u64 = timeout_str.parse().map_err(|_| {
+        Error::InvalidArguments("BRPOP timeout must be a non-negative integer".to_string())
+    })?;
+
+    match db.brpop(&key, timeout_secs).await? {
+        Some(value) => Ok(RespValue::BulkString(value)),
+        None => Ok(RespValue::NullBulkString),
+    }
+}
+
+/// Handle LLEN command
+///
+/// Syntax: LLEN key
+/// Returns: Integer - length of list
+fn handle_llen(args: &[RespValue], db: &Database) -> Result<RespValue> {
+    if args.len() != 2 {
+        return Err(Error::InvalidArguments(
+            "LLEN requires exactly one argument".to_string(),
+        ));
+    }
+
+    let key = args[1].as_string()?;
+    let length = db.llen(&key)?;
+
+    Ok(RespValue::Integer(length as i64))
+}
+
+/// Handle LRANGE command
+///
+/// Syntax: LRANGE key start stop
+/// Returns: Array of bulk strings
+fn handle_lrange(args: &[RespValue], db: &Database) -> Result<RespValue> {
+    if args.len() != 4 {
+        return Err(Error::InvalidArguments(
+            "LRANGE requires exactly three arguments".to_string(),
+        ));
+    }
+
+    let key = args[1].as_string()?;
+    let start_str = args[2].as_string()?;
+    let stop_str = args[3].as_string()?;
+
+    let start: i64 = start_str
+        .parse()
+        .map_err(|_| Error::InvalidArguments("LRANGE start must be an integer".to_string()))?;
+    let stop: i64 = stop_str
+        .parse()
+        .map_err(|_| Error::InvalidArguments("LRANGE stop must be an integer".to_string()))?;
+
+    let elements = db.lrange(&key, start, stop)?;
+    let resp_elements: Vec<RespValue> = elements.into_iter().map(RespValue::BulkString).collect();
+
+    Ok(RespValue::Array(resp_elements))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -480,7 +619,7 @@ mod tests {
         let args = vec![RespValue::BulkString(b"PING".to_vec())];
         let value = RespValue::Array(args);
 
-        let result = handle_command(value, &mut authenticated, &session_key, &db);
+        let result = handle_command(value, &mut authenticated, &session_key, &db).await;
 
         assert!(matches!(result, Err(Error::NoAuth)));
     }
@@ -494,7 +633,7 @@ mod tests {
         let args = vec![RespValue::BulkString(b"UNKNOWN".to_vec())];
         let value = RespValue::Array(args);
 
-        let result = handle_command(value, &mut authenticated, &session_key, &db);
+        let result = handle_command(value, &mut authenticated, &session_key, &db).await;
 
         assert!(matches!(result, Err(Error::UnknownCommand(_))));
     }
