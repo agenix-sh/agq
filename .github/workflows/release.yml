@@ -1,0 +1,136 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*.*.*'
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  create-release:
+    name: Create Release
+    runs-on: ubuntu-latest
+    outputs:
+      upload_url: ${{ steps.create_release.outputs.upload_url }}
+      version: ${{ steps.get_version.outputs.version }}
+    steps:
+      - name: Get version from tag
+        id: get_version
+        run: echo "version=${GITHUB_REF#refs/tags/v}" >> $GITHUB_OUTPUT
+
+      - name: Create Release
+        id: create_release
+        uses: actions/create-release@v1
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          tag_name: ${{ github.ref }}
+          release_name: AGQ v${{ steps.get_version.outputs.version }}
+          draft: false
+          prerelease: false
+          body: |
+            AGQ v${{ steps.get_version.outputs.version }}
+
+            ## Installation
+
+            Download the appropriate binary for your platform below.
+
+            ## Supported Platforms
+            - macOS ARM64 (Apple Silicon)
+            - macOS x86_64 (Intel)
+            - Linux x86_64
+            - Linux ARM64
+
+  build-release:
+    name: Build Release - ${{ matrix.os }} (${{ matrix.arch }})
+    needs: create-release
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      matrix:
+        include:
+          # macOS ARM64 (Apple Silicon)
+          - os: macos
+            arch: arm64
+            runner: macos-14
+            target: aarch64-apple-darwin
+            binary_name: agq
+            asset_name: agq-macos-arm64
+
+          # macOS x86_64 (Intel)
+          - os: macos
+            arch: x86_64
+            runner: macos-13
+            target: x86_64-apple-darwin
+            binary_name: agq
+            asset_name: agq-macos-x86_64
+
+          # Linux x86_64
+          - os: linux
+            arch: x86_64
+            runner: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            binary_name: agq
+            asset_name: agq-linux-x86_64
+
+          # Linux ARM64
+          - os: linux
+            arch: arm64
+            runner: ubuntu-latest
+            target: aarch64-unknown-linux-gnu
+            binary_name: agq
+            asset_name: agq-linux-arm64
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Install cross-compilation tools (Linux ARM64)
+        if: matrix.target == 'aarch64-unknown-linux-gnu'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y gcc-aarch64-linux-gnu g++-aarch64-linux-gnu
+
+      - name: Build release binary
+        run: cargo build --release --target ${{ matrix.target }}
+
+      - name: Strip binary (Linux/macOS)
+        if: matrix.os != 'windows'
+        run: strip target/${{ matrix.target }}/release/${{ matrix.binary_name }}
+
+      - name: Create tarball
+        run: |
+          cd target/${{ matrix.target }}/release
+          tar czf ${{ matrix.asset_name }}.tar.gz ${{ matrix.binary_name }}
+          cd -
+          mv target/${{ matrix.target }}/release/${{ matrix.asset_name }}.tar.gz .
+
+      - name: Generate checksums
+        run: |
+          shasum -a 256 ${{ matrix.asset_name }}.tar.gz > ${{ matrix.asset_name }}.tar.gz.sha256
+
+      - name: Upload release asset
+        uses: actions/upload-release-asset@v1
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          upload_url: ${{ needs.create-release.outputs.upload_url }}
+          asset_path: ./${{ matrix.asset_name }}.tar.gz
+          asset_name: ${{ matrix.asset_name }}.tar.gz
+          asset_content_type: application/gzip
+
+      - name: Upload checksum
+        uses: actions/upload-release-asset@v1
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          upload_url: ${{ needs.create-release.outputs.upload_url }}
+          asset_path: ./${{ matrix.asset_name }}.tar.gz.sha256
+          asset_name: ${{ matrix.asset_name }}.tar.gz.sha256
+          asset_content_type: text/plain

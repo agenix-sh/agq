@@ -2,6 +2,7 @@
 name = "agq"
 version = "0.1.0"
 edition = "2021"
+rust-version = "1.82"
 authors = ["AGX Core Team"]
 description = "AGQ - Queue Manager for the AGX Agentic Ecosystem"
 license = "MIT OR Apache-2.0"
