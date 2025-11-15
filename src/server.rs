@@ -432,13 +432,11 @@ mod tests {
         let avg_no_match = total_no_match.as_nanos() / 1000;
 
         // Timing should be similar (within 50% variance due to system noise)
+        #[allow(clippy::cast_precision_loss)]
         let ratio = avg_match as f64 / avg_no_match as f64;
         assert!(
             (0.5..=2.0).contains(&ratio),
-            "Timing difference too large: avg {} ns vs avg {} ns (ratio: {})",
-            avg_match,
-            avg_no_match,
-            ratio
+            "Timing difference too large: avg {avg_match} ns vs avg {avg_no_match} ns (ratio: {ratio})"
         );
     }
 }

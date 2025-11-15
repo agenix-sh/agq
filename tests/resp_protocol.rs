@@ -25,7 +25,7 @@ async fn start_test_server() -> (tokio::task::JoinHandle<()>, u16) {
 
     // Start actual server
     let handle = tokio::spawn(async move {
-        let server = Server::new(&format!("127.0.0.1:{}", port), TEST_SESSION_KEY.to_vec())
+        let server = Server::new(&format!("127.0.0.1:{port}"), TEST_SESSION_KEY.to_vec())
             .await
             .expect("Failed to create server");
 
@@ -55,7 +55,7 @@ async fn test_auth_command_success() {
     let (_handle, port) = start_test_server().await;
 
     // Connect
-    let mut stream = TcpStream::connect(format!("127.0.0.1:{}", port))
+    let mut stream = TcpStream::connect(format!("127.0.0.1:{port}"))
         .await
         .expect("Failed to connect");
 
@@ -72,7 +72,7 @@ async fn test_auth_command_success() {
 async fn test_auth_command_missing_key() {
     let (_handle, port) = start_test_server().await;
 
-    let mut stream = TcpStream::connect(format!("127.0.0.1:{}", port))
+    let mut stream = TcpStream::connect(format!("127.0.0.1:{port}"))
         .await
         .expect("Failed to connect");
 
@@ -91,7 +91,7 @@ async fn test_auth_command_missing_key() {
 async fn test_auth_command_empty_key() {
     let (_handle, port) = start_test_server().await;
 
-    let mut stream = TcpStream::connect(format!("127.0.0.1:{}", port))
+    let mut stream = TcpStream::connect(format!("127.0.0.1:{port}"))
         .await
         .expect("Failed to connect");
 
@@ -110,7 +110,7 @@ async fn test_auth_command_empty_key() {
 async fn test_ping_command_after_auth() {
     let (_handle, port) = start_test_server().await;
 
-    let mut stream = TcpStream::connect(format!("127.0.0.1:{}", port))
+    let mut stream = TcpStream::connect(format!("127.0.0.1:{port}"))
         .await
         .expect("Failed to connect");
 
@@ -131,7 +131,7 @@ async fn test_ping_command_after_auth() {
 async fn test_ping_without_auth() {
     let (_handle, port) = start_test_server().await;
 
-    let mut stream = TcpStream::connect(format!("127.0.0.1:{}", port))
+    let mut stream = TcpStream::connect(format!("127.0.0.1:{port}"))
         .await
         .expect("Failed to connect");
 
@@ -154,7 +154,7 @@ async fn test_ping_without_auth() {
 async fn test_ping_with_message() {
     let (_handle, port) = start_test_server().await;
 
-    let mut stream = TcpStream::connect(format!("127.0.0.1:{}", port))
+    let mut stream = TcpStream::connect(format!("127.0.0.1:{port}"))
         .await
         .expect("Failed to connect");
 
@@ -177,7 +177,7 @@ async fn test_ping_with_message() {
 async fn test_invalid_command() {
     let (_handle, port) = start_test_server().await;
 
-    let mut stream = TcpStream::connect(format!("127.0.0.1:{}", port))
+    let mut stream = TcpStream::connect(format!("127.0.0.1:{port}"))
         .await
         .expect("Failed to connect");
 
@@ -200,7 +200,7 @@ async fn test_invalid_command() {
 async fn test_malformed_resp_command() {
     let (_handle, port) = start_test_server().await;
 
-    let mut stream = TcpStream::connect(format!("127.0.0.1:{}", port))
+    let mut stream = TcpStream::connect(format!("127.0.0.1:{port}"))
         .await
         .expect("Failed to connect");
 
@@ -233,13 +233,13 @@ async fn test_malformed_resp_command() {
 async fn test_oversized_command() {
     let (_handle, port) = start_test_server().await;
 
-    let mut stream = TcpStream::connect(format!("127.0.0.1:{}", port))
+    let mut stream = TcpStream::connect(format!("127.0.0.1:{port}"))
         .await
         .expect("Failed to connect");
 
     // Send command with oversized argument (> 1MB)
     let size = 2 * 1024 * 1024; // 2MB
-    let oversized_cmd = format!("*2\r\n$4\r\nAUTH\r\n${}\r\n", size);
+    let oversized_cmd = format!("*2\r\n$4\r\nAUTH\r\n${size}\r\n");
     stream
         .write_all(oversized_cmd.as_bytes())
         .await
@@ -271,10 +271,9 @@ async fn test_concurrent_connections() {
     // Spawn 10 concurrent clients
     let mut handles = vec![];
 
-    for i in 0..10 {
-        let port = port;
+    for _i in 0..10 {
         let handle = tokio::spawn(async move {
-            let mut stream = TcpStream::connect(format!("127.0.0.1:{}", port))
+            let mut stream = TcpStream::connect(format!("127.0.0.1:{port}"))
                 .await
                 .expect("Failed to connect");
 
