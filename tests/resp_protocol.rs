@@ -399,7 +399,10 @@ async fn test_exists_command() {
     // EXISTS on nonexistent key: *2\r\n$6\r\nEXISTS\r\n$5\r\nmykey\r\n
     let exists_cmd = b"*2\r\n$6\r\nEXISTS\r\n$5\r\nmykey\r\n";
     let response = send_resp_command(&mut stream, exists_cmd).await;
-    assert_eq!(&response, b":0\r\n", "EXISTS should return 0 for nonexistent");
+    assert_eq!(
+        &response, b":0\r\n",
+        "EXISTS should return 0 for nonexistent"
+    );
 
     // SET the key
     let set_cmd = b"*3\r\n$3\r\nSET\r\n$5\r\nmykey\r\n$7\r\nmyvalue\r\n";
@@ -407,7 +410,10 @@ async fn test_exists_command() {
 
     // EXISTS should now return 1
     let response = send_resp_command(&mut stream, exists_cmd).await;
-    assert_eq!(&response, b":1\r\n", "EXISTS should return 1 for existing key");
+    assert_eq!(
+        &response, b":1\r\n",
+        "EXISTS should return 1 for existing key"
+    );
 }
 
 #[tokio::test]
@@ -456,8 +462,7 @@ async fn test_binary_data_storage() {
     let get_cmd = b"*2\r\n$3\r\nGET\r\n$6\r\nbinary\r\n";
     let response = send_resp_command(&mut stream, get_cmd).await;
     assert_eq!(
-        &response,
-        b"$6\r\n\x00\x01\x02\xFF\xFE\xFD\r\n",
+        &response, b"$6\r\n\x00\x01\x02\xFF\xFE\xFD\r\n",
         "Should store and retrieve binary data correctly"
     );
 }
