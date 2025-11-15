@@ -89,12 +89,17 @@ jobs:
           # Extract line coverage percentage from TOTAL row
           # The format is: TOTAL <regions> <missed> <cover%> <funcs> <missed> <cover%> <lines> <missed> <cover%> <branches> <missed> <cover%>
           # We want the 3rd percentage (Lines Cover), which is field 10
-          COVERAGE=$(grep "TOTAL" coverage_summary.txt | awk '{print $10}' | sed 's/%//')
-          echo "Coverage: ${COVERAGE}%"
+          COVERAGE_RAW=$(grep "TOTAL" coverage_summary.txt | awk '{print $10}')
+          COVERAGE=$(echo "$COVERAGE_RAW" | sed 's/%//')
+
+          echo "Coverage (raw): $COVERAGE_RAW"
+          echo "Coverage (numeric): $COVERAGE"
 
           THRESHOLD=80
-          # Use awk for floating point comparison (bc might not be available)
-          if [ $(echo "$COVERAGE < $THRESHOLD" | awk '{print ($1 < $2)}') -eq 1 ]; then
+          # Use awk for floating point comparison
+          RESULT=$(echo "$COVERAGE $THRESHOLD" | awk '{if ($1 < $2) print "FAIL"; else print "PASS"}')
+
+          if [ "$RESULT" = "FAIL" ]; then
             echo "❌ Coverage ${COVERAGE}% is below threshold ${THRESHOLD}%"
             exit 1
           fi
