@@ -10,8 +10,10 @@ dependencies = [
  "clap",
  "hex",
  "proptest",
+ "redb",
  "ring",
  "subtle",
+ "tempfile",
  "thiserror",
  "tokio",
  "tracing",
@@ -462,6 +464,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d25bf25ec5ae4a3f1b92f929810509a2f53d7dca2f50b794ff57e3face536c8f"
 dependencies = [
  "rand_core",
+]
+
+[[package]]
+name = "redb"
+version = "2.6.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "8eca1e9d98d5a7e9002d0013e18d5a9b000aee942eb134883a82f06ebffb6c01"
+dependencies = [
+ "libc",
 ]
 
 [[package]]

@@ -52,11 +52,12 @@ Ensures cross-platform (macOS/Linux) installations with zero external dependenci
 ### 3.3 Redis-CLI-style Protocol
 All components communicate using RESP over TCP with session-key authentication.
 
-### 3.4 HeroDB Embedded Store (redb)
+### 3.4 Embedded Storage (redb)
 Single-file ACID KV store backing Redis-compatible primitives:
-- lists  
-- sorted sets  
-- hashes  
+- strings (GET/SET/DEL/EXISTS)
+- lists (LPUSH/RPOP/BRPOP)
+- sorted sets (ZADD/ZRANGE)
+- hashes (HSET/HGET/HDEL)  
 
 ### 3.5 Deterministic Execution
 Workers cannot call LLMs.  
@@ -76,10 +77,10 @@ A deterministic, inspectable execution description.
 - Can operate in Ops Mode (query jobs/workers)
 
 ### 4.2 `agq`: Queue/Scheduler
-- Embedded HeroDB  
-- Plan acceptance  
-- Job storage  
-- Worker dispatch  
+- Embedded redb storage (ACID key-value database)
+- Plan acceptance
+- Job storage
+- Worker dispatch
 - Failure handling and retries
 
 ### 4.3 `agw`: Worker
@@ -101,11 +102,13 @@ A deterministic, inspectable execution description.
 
 ---
 
-## 6. Keyspace Layout (HeroDB)
-Plans stored as `plan:<id>`  
-Jobs: `job:<id>:plan`, `job:<id>:status`, etc.  
-Queues: `queue:ready`, `queue:scheduled`  
+## 6. Keyspace Layout (redb Storage)
+Plans stored as `plan:<id>`
+Jobs: `job:<id>:plan`, `job:<id>:status`, etc.
+Queues: `queue:ready`, `queue:scheduled`
 Workers: `worker:<id>:alive`, `worker:<id>:tools`
+
+**Implementation:** All keys use string encoding with Redis RESP protocol. The embedded redb database provides ACID guarantees and single-file storage at `~/.agq/data.redb` by default.
 
 ---
 

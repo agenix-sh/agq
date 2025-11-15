@@ -1,5 +1,9 @@
 tmp/
 
+# Coverage reports
+lcov.info
+*.profraw
+*.profdata
 
 # Added by cargo
 

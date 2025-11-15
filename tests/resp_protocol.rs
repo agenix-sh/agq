@@ -10,7 +10,8 @@ const TEST_SESSION_KEY: &[u8] = b"test_session_key_32_bytes_long!!";
 
 /// Helper to start the AGQ server on a random port for testing
 async fn start_test_server() -> (tokio::task::JoinHandle<()>, u16) {
-    use agq::Server;
+    use agq::{Database, Server};
+    use tempfile::TempDir;
 
     // Bind to random port
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
@@ -25,12 +26,20 @@ async fn start_test_server() -> (tokio::task::JoinHandle<()>, u16) {
 
     // Start actual server
     let handle = tokio::spawn(async move {
-        let server = Server::new(&format!("127.0.0.1:{port}"), TEST_SESSION_KEY.to_vec())
+        // Create temporary database for this test
+        let temp_dir = TempDir::new().expect("Failed to create temp dir");
+        let db_path = temp_dir.path().join("test.redb");
+        let db = Database::open(&db_path).expect("Failed to open database");
+
+        let server = Server::new(&format!("127.0.0.1:{port}"), TEST_SESSION_KEY.to_vec(), db)
             .await
             .expect("Failed to create server");
 
         // Run server (will run until process exits in tests)
         let _ = server.run().await;
+
+        // Keep temp_dir alive
+        drop(temp_dir);
     });
 
     // Give server time to start
@@ -303,4 +312,157 @@ async fn test_concurrent_connections() {
     for handle in handles {
         handle.await.expect("Client task failed");
     }
+}
+
+#[tokio::test]
+async fn test_set_and_get_commands() {
+    let (_handle, port) = start_test_server().await;
+
+    let mut stream = TcpStream::connect(format!("127.0.0.1:{port}"))
+        .await
+        .expect("Failed to connect");
+
+    // AUTH first
+    let auth_cmd = b"*2\r\n$4\r\nAUTH\r\n$32\r\ntest_session_key_32_bytes_long!!\r\n";
+    send_resp_command(&mut stream, auth_cmd).await;
+
+    // SET mykey myvalue: *3\r\n$3\r\nSET\r\n$5\r\nmykey\r\n$7\r\nmyvalue\r\n
+    let set_cmd = b"*3\r\n$3\r\nSET\r\n$5\r\nmykey\r\n$7\r\nmyvalue\r\n";
+    let response = send_resp_command(&mut stream, set_cmd).await;
+    assert_eq!(&response, b"+OK\r\n", "SET should return +OK");
+
+    // GET mykey: *2\r\n$3\r\nGET\r\n$5\r\nmykey\r\n
+    let get_cmd = b"*2\r\n$3\r\nGET\r\n$5\r\nmykey\r\n";
+    let response = send_resp_command(&mut stream, get_cmd).await;
+    assert_eq!(
+        &response, b"$7\r\nmyvalue\r\n",
+        "GET should return stored value"
+    );
+}
+
+#[tokio::test]
+async fn test_get_nonexistent_key() {
+    let (_handle, port) = start_test_server().await;
+
+    let mut stream = TcpStream::connect(format!("127.0.0.1:{port}"))
+        .await
+        .expect("Failed to connect");
+
+    // AUTH first
+    let auth_cmd = b"*2\r\n$4\r\nAUTH\r\n$32\r\ntest_session_key_32_bytes_long!!\r\n";
+    send_resp_command(&mut stream, auth_cmd).await;
+
+    // GET nonexistent: *2\r\n$3\r\nGET\r\n$11\r\nnonexistent\r\n
+    let get_cmd = b"*2\r\n$3\r\nGET\r\n$11\r\nnonexistent\r\n";
+    let response = send_resp_command(&mut stream, get_cmd).await;
+    assert_eq!(&response, b"$-1\r\n", "GET nonexistent should return nil");
+}
+
+#[tokio::test]
+async fn test_del_command() {
+    let (_handle, port) = start_test_server().await;
+
+    let mut stream = TcpStream::connect(format!("127.0.0.1:{port}"))
+        .await
+        .expect("Failed to connect");
+
+    // AUTH first
+    let auth_cmd = b"*2\r\n$4\r\nAUTH\r\n$32\r\ntest_session_key_32_bytes_long!!\r\n";
+    send_resp_command(&mut stream, auth_cmd).await;
+
+    // SET testkey testvalue
+    let set_cmd = b"*3\r\n$3\r\nSET\r\n$7\r\ntestkey\r\n$9\r\ntestvalue\r\n";
+    send_resp_command(&mut stream, set_cmd).await;
+
+    // DEL testkey: *2\r\n$3\r\nDEL\r\n$7\r\ntestkey\r\n
+    let del_cmd = b"*2\r\n$3\r\nDEL\r\n$7\r\ntestkey\r\n";
+    let response = send_resp_command(&mut stream, del_cmd).await;
+    assert_eq!(&response, b":1\r\n", "DEL should return 1 for deleted key");
+
+    // DEL again - should return 0
+    let response = send_resp_command(&mut stream, del_cmd).await;
+    assert_eq!(&response, b":0\r\n", "DEL nonexistent should return 0");
+}
+
+#[tokio::test]
+async fn test_exists_command() {
+    let (_handle, port) = start_test_server().await;
+
+    let mut stream = TcpStream::connect(format!("127.0.0.1:{port}"))
+        .await
+        .expect("Failed to connect");
+
+    // AUTH first
+    let auth_cmd = b"*2\r\n$4\r\nAUTH\r\n$32\r\ntest_session_key_32_bytes_long!!\r\n";
+    send_resp_command(&mut stream, auth_cmd).await;
+
+    // EXISTS on nonexistent key: *2\r\n$6\r\nEXISTS\r\n$5\r\nmykey\r\n
+    let exists_cmd = b"*2\r\n$6\r\nEXISTS\r\n$5\r\nmykey\r\n";
+    let response = send_resp_command(&mut stream, exists_cmd).await;
+    assert_eq!(
+        &response, b":0\r\n",
+        "EXISTS should return 0 for nonexistent"
+    );
+
+    // SET the key
+    let set_cmd = b"*3\r\n$3\r\nSET\r\n$5\r\nmykey\r\n$7\r\nmyvalue\r\n";
+    send_resp_command(&mut stream, set_cmd).await;
+
+    // EXISTS should now return 1
+    let response = send_resp_command(&mut stream, exists_cmd).await;
+    assert_eq!(
+        &response, b":1\r\n",
+        "EXISTS should return 1 for existing key"
+    );
+}
+
+#[tokio::test]
+async fn test_storage_commands_require_auth() {
+    let (_handle, port) = start_test_server().await;
+
+    let mut stream = TcpStream::connect(format!("127.0.0.1:{port}"))
+        .await
+        .expect("Failed to connect");
+
+    // Try SET without auth
+    let set_cmd = b"*3\r\n$3\r\nSET\r\n$5\r\nmykey\r\n$7\r\nmyvalue\r\n";
+    let response = send_resp_command(&mut stream, set_cmd).await;
+    assert!(
+        response.starts_with(b"-ERR") && String::from_utf8_lossy(&response).contains("NOAUTH"),
+        "SET without AUTH should return NOAUTH error"
+    );
+
+    // Try GET without auth
+    let get_cmd = b"*2\r\n$3\r\nGET\r\n$5\r\nmykey\r\n";
+    let response = send_resp_command(&mut stream, get_cmd).await;
+    assert!(
+        response.starts_with(b"-ERR") && String::from_utf8_lossy(&response).contains("NOAUTH"),
+        "GET without AUTH should return NOAUTH error"
+    );
+}
+
+#[tokio::test]
+async fn test_binary_data_storage() {
+    let (_handle, port) = start_test_server().await;
+
+    let mut stream = TcpStream::connect(format!("127.0.0.1:{port}"))
+        .await
+        .expect("Failed to connect");
+
+    // AUTH first
+    let auth_cmd = b"*2\r\n$4\r\nAUTH\r\n$32\r\ntest_session_key_32_bytes_long!!\r\n";
+    send_resp_command(&mut stream, auth_cmd).await;
+
+    // SET binary data (null bytes): *3\r\n$3\r\nSET\r\n$6\r\nbinary\r\n$6\r\n\x00\x01\x02\xFF\xFE\xFD\r\n
+    let set_cmd = b"*3\r\n$3\r\nSET\r\n$6\r\nbinary\r\n$6\r\n\x00\x01\x02\xFF\xFE\xFD\r\n";
+    let response = send_resp_command(&mut stream, set_cmd).await;
+    assert_eq!(&response, b"+OK\r\n");
+
+    // GET binary data
+    let get_cmd = b"*2\r\n$3\r\nGET\r\n$6\r\nbinary\r\n";
+    let response = send_resp_command(&mut stream, get_cmd).await;
+    assert_eq!(
+        &response, b"$6\r\n\x00\x01\x02\xFF\xFE\xFD\r\n",
+        "Should store and retrieve binary data correctly"
+    );
 }
