@@ -2,6 +2,7 @@
 
 use crate::storage::{ListOps, StringOps};
 use crate::{Error, Result};
+use async_trait::async_trait;
 use redb::{Database as RedbDatabase, ReadableTable, TableDefinition};
 use std::collections::HashMap;
 use std::path::Path;
@@ -29,7 +30,8 @@ pub struct Database {
     db: RedbDatabase,
     /// Notifications for list changes (used by BRPOP)
     /// Key format: list key name
-    list_notifiers: Arc<tokio::sync::Mutex<HashMap<String, Arc<Notify>>>>,
+    /// Uses std::sync::Mutex because we need to access it from both sync (LPUSH) and async (BRPOP) contexts
+    list_notifiers: Arc<std::sync::Mutex<HashMap<String, Arc<Notify>>>>,
 }
 
 impl Database {
@@ -81,7 +83,7 @@ impl Database {
 
         Ok(Self {
             db,
-            list_notifiers: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
+            list_notifiers: Arc::new(std::sync::Mutex::new(HashMap::new())),
         })
     }
 }
@@ -201,6 +203,7 @@ fn list_element_key(list_key: &str, index: i64) -> String {
     format!("{}:{}", list_key, index)
 }
 
+#[async_trait]
 impl ListOps for Database {
     fn lpush(&self, key: &str, value: &[u8]) -> Result<u64> {
         let write_txn = self
@@ -248,7 +251,9 @@ impl ListOps for Database {
             .map_err(|e| Error::Protocol(format!("Failed to commit transaction: {e}")))?;
 
         // Notify any waiting BRPOP calls
-        if let Ok(notifiers) = self.list_notifiers.try_lock() {
+        // Uses std::sync::Mutex::lock() which blocks until the lock is available.
+        // This ensures we never drop notifications (fixing the try_lock bug).
+        if let Ok(notifiers) = self.list_notifiers.lock() {
             if let Some(notify) = notifiers.get(key) {
                 notify.notify_waiters();
             }
@@ -421,7 +426,10 @@ impl ListOps for Database {
 
         // Get or create notifier for this key
         let notifier = {
-            let mut notifiers = self.list_notifiers.lock().await;
+            let mut notifiers = self
+                .list_notifiers
+                .lock()
+                .map_err(|_| Error::Protocol("Failed to acquire notifier lock".to_string()))?;
             notifiers
                 .entry(key.to_string())
                 .or_insert_with(|| Arc::new(Notify::new()))

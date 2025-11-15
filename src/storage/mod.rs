@@ -11,6 +11,7 @@ mod db;
 pub use db::Database;
 
 use crate::Result;
+use async_trait::async_trait;
 
 /// Storage operations for string (key-value) data
 pub trait StringOps {
@@ -44,6 +45,7 @@ pub trait StringOps {
 }
 
 /// Storage operations for list (queue) data
+#[async_trait]
 pub trait ListOps {
     /// Push element to the left (head) of a list
     ///
@@ -68,11 +70,7 @@ pub trait ListOps {
     /// # Errors
     ///
     /// Returns an error if the database operation fails.
-    fn brpop(
-        &self,
-        key: &str,
-        timeout_secs: u64,
-    ) -> impl std::future::Future<Output = Result<Option<Vec<u8>>>> + Send;
+    async fn brpop(&self, key: &str, timeout_secs: u64) -> Result<Option<Vec<u8>>>;
 
     /// Get the length of a list
     ///
