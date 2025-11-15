@@ -11,6 +11,7 @@ mod db;
 pub use db::Database;
 
 use crate::Result;
+use async_trait::async_trait;
 
 /// Storage operations for string (key-value) data
 pub trait StringOps {
@@ -41,4 +42,47 @@ pub trait StringOps {
     ///
     /// Returns an error if the database operation fails.
     fn exists(&self, key: &str) -> Result<bool>;
+}
+
+/// Storage operations for list (queue) data
+#[async_trait]
+pub trait ListOps {
+    /// Push element to the left (head) of a list
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the database operation fails.
+    fn lpush(&self, key: &str, value: &[u8]) -> Result<u64>;
+
+    /// Pop element from the right (tail) of a list
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the database operation fails.
+    fn rpop(&self, key: &str) -> Result<Option<Vec<u8>>>;
+
+    /// Pop element from the right (tail) of a list, blocking until available or timeout
+    ///
+    /// # Arguments
+    /// * `key` - The list key to pop from
+    /// * `timeout_secs` - Timeout in seconds (0 = block indefinitely)
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the database operation fails.
+    async fn brpop(&self, key: &str, timeout_secs: u64) -> Result<Option<Vec<u8>>>;
+
+    /// Get the length of a list
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the database operation fails.
+    fn llen(&self, key: &str) -> Result<u64>;
+
+    /// Get a range of elements from a list
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the database operation fails.
+    fn lrange(&self, key: &str, start: i64, stop: i64) -> Result<Vec<Vec<u8>>>;
 }

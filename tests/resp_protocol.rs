@@ -466,3 +466,199 @@ async fn test_binary_data_storage() {
         "Should store and retrieve binary data correctly"
     );
 }
+
+#[tokio::test]
+async fn test_lpush_and_llen() {
+    let (_handle, port) = start_test_server().await;
+    let mut stream = TcpStream::connect(format!("127.0.0.1:{port}"))
+        .await
+        .expect("Failed to connect");
+
+    // AUTH first
+    let auth_cmd = b"*2\r\n$4\r\nAUTH\r\n$32\r\ntest_session_key_32_bytes_long!!\r\n";
+    send_resp_command(&mut stream, auth_cmd).await;
+
+    // LPUSH first element
+    let lpush_cmd = b"*3\r\n$5\r\nLPUSH\r\n$6\r\nmylist\r\n$5\r\nfirst\r\n";
+    let response = send_resp_command(&mut stream, lpush_cmd).await;
+    assert_eq!(&response, b":1\r\n", "First LPUSH should return length 1");
+
+    // LPUSH second element
+    let lpush_cmd = b"*3\r\n$5\r\nLPUSH\r\n$6\r\nmylist\r\n$6\r\nsecond\r\n";
+    let response = send_resp_command(&mut stream, lpush_cmd).await;
+    assert_eq!(&response, b":2\r\n", "Second LPUSH should return length 2");
+
+    // LLEN
+    let llen_cmd = b"*2\r\n$4\r\nLLEN\r\n$6\r\nmylist\r\n";
+    let response = send_resp_command(&mut stream, llen_cmd).await;
+    assert_eq!(&response, b":2\r\n", "LLEN should return 2");
+}
+
+#[tokio::test]
+async fn test_lpush_and_rpop() {
+    let (_handle, port) = start_test_server().await;
+    let mut stream = TcpStream::connect(format!("127.0.0.1:{port}"))
+        .await
+        .expect("Failed to connect");
+
+    // AUTH first
+    let auth_cmd = b"*2\r\n$4\r\nAUTH\r\n$32\r\ntest_session_key_32_bytes_long!!\r\n";
+    send_resp_command(&mut stream, auth_cmd).await;
+
+    // LPUSH three elements
+    send_resp_command(
+        &mut stream,
+        b"*3\r\n$5\r\nLPUSH\r\n$6\r\nmylist\r\n$5\r\nfirst\r\n",
+    )
+    .await;
+    send_resp_command(
+        &mut stream,
+        b"*3\r\n$5\r\nLPUSH\r\n$6\r\nmylist\r\n$6\r\nsecond\r\n",
+    )
+    .await;
+    send_resp_command(
+        &mut stream,
+        b"*3\r\n$5\r\nLPUSH\r\n$6\r\nmylist\r\n$5\r\nthird\r\n",
+    )
+    .await;
+
+    // RPOP should return "first" (tail element)
+    let rpop_cmd = b"*2\r\n$4\r\nRPOP\r\n$6\r\nmylist\r\n";
+    let response = send_resp_command(&mut stream, rpop_cmd).await;
+    assert_eq!(&response, b"$5\r\nfirst\r\n", "RPOP should return 'first'");
+
+    // RPOP again should return "second"
+    let response = send_resp_command(&mut stream, rpop_cmd).await;
+    assert_eq!(
+        &response, b"$6\r\nsecond\r\n",
+        "RPOP should return 'second'"
+    );
+
+    // RPOP last element
+    let response = send_resp_command(&mut stream, rpop_cmd).await;
+    assert_eq!(&response, b"$5\r\nthird\r\n", "RPOP should return 'third'");
+
+    // RPOP on empty list
+    let response = send_resp_command(&mut stream, rpop_cmd).await;
+    assert_eq!(
+        &response, b"$-1\r\n",
+        "RPOP on empty list should return nil"
+    );
+}
+
+#[tokio::test]
+async fn test_lrange() {
+    let (_handle, port) = start_test_server().await;
+    let mut stream = TcpStream::connect(format!("127.0.0.1:{port}"))
+        .await
+        .expect("Failed to connect");
+
+    // AUTH first
+    let auth_cmd = b"*2\r\n$4\r\nAUTH\r\n$32\r\ntest_session_key_32_bytes_long!!\r\n";
+    send_resp_command(&mut stream, auth_cmd).await;
+
+    // LPUSH three elements
+    send_resp_command(
+        &mut stream,
+        b"*3\r\n$5\r\nLPUSH\r\n$6\r\nmylist\r\n$3\r\none\r\n",
+    )
+    .await;
+    send_resp_command(
+        &mut stream,
+        b"*3\r\n$5\r\nLPUSH\r\n$6\r\nmylist\r\n$3\r\ntwo\r\n",
+    )
+    .await;
+    send_resp_command(
+        &mut stream,
+        b"*3\r\n$5\r\nLPUSH\r\n$6\r\nmylist\r\n$5\r\nthree\r\n",
+    )
+    .await;
+
+    // LRANGE 0 -1 (all elements)
+    let lrange_cmd = b"*4\r\n$6\r\nLRANGE\r\n$6\r\nmylist\r\n$1\r\n0\r\n$2\r\n-1\r\n";
+    let response = send_resp_command(&mut stream, lrange_cmd).await;
+    assert_eq!(
+        &response, b"*3\r\n$5\r\nthree\r\n$3\r\ntwo\r\n$3\r\none\r\n",
+        "LRANGE should return all three elements in LPUSH order"
+    );
+
+    // LRANGE 0 1 (first two)
+    let lrange_cmd = b"*4\r\n$6\r\nLRANGE\r\n$6\r\nmylist\r\n$1\r\n0\r\n$1\r\n1\r\n";
+    let response = send_resp_command(&mut stream, lrange_cmd).await;
+    assert_eq!(
+        &response, b"*2\r\n$5\r\nthree\r\n$3\r\ntwo\r\n",
+        "LRANGE 0 1 should return first two elements"
+    );
+}
+
+#[tokio::test]
+async fn test_brpop_immediate() {
+    let (_handle, port) = start_test_server().await;
+    let mut stream = TcpStream::connect(format!("127.0.0.1:{port}"))
+        .await
+        .expect("Failed to connect");
+
+    // AUTH first
+    let auth_cmd = b"*2\r\n$4\r\nAUTH\r\n$32\r\ntest_session_key_32_bytes_long!!\r\n";
+    send_resp_command(&mut stream, auth_cmd).await;
+
+    // LPUSH element
+    send_resp_command(
+        &mut stream,
+        b"*3\r\n$5\r\nLPUSH\r\n$6\r\nmylist\r\n$5\r\nvalue\r\n",
+    )
+    .await;
+
+    // BRPOP should return immediately
+    let brpop_cmd = b"*3\r\n$5\r\nBRPOP\r\n$6\r\nmylist\r\n$1\r\n1\r\n";
+    let response = send_resp_command(&mut stream, brpop_cmd).await;
+    assert_eq!(
+        &response, b"$5\r\nvalue\r\n",
+        "BRPOP should return immediately"
+    );
+}
+
+#[tokio::test]
+async fn test_brpop_timeout() {
+    let (_handle, port) = start_test_server().await;
+    let mut stream = TcpStream::connect(format!("127.0.0.1:{port}"))
+        .await
+        .expect("Failed to connect");
+
+    // AUTH first
+    let auth_cmd = b"*2\r\n$4\r\nAUTH\r\n$32\r\ntest_session_key_32_bytes_long!!\r\n";
+    send_resp_command(&mut stream, auth_cmd).await;
+
+    // BRPOP on empty list with 1 second timeout
+    let start = std::time::Instant::now();
+    let brpop_cmd = b"*3\r\n$5\r\nBRPOP\r\n$6\r\nmylist\r\n$1\r\n1\r\n";
+    let response = send_resp_command(&mut stream, brpop_cmd).await;
+    let elapsed = start.elapsed();
+
+    assert_eq!(&response, b"$-1\r\n", "BRPOP should timeout and return nil");
+    assert!(
+        elapsed >= std::time::Duration::from_secs(1),
+        "BRPOP should wait at least 1 second"
+    );
+    assert!(
+        elapsed < std::time::Duration::from_millis(1500),
+        "BRPOP should not wait much longer than timeout"
+    );
+}
+
+#[tokio::test]
+async fn test_llen_empty_list() {
+    let (_handle, port) = start_test_server().await;
+    let mut stream = TcpStream::connect(format!("127.0.0.1:{port}"))
+        .await
+        .expect("Failed to connect");
+
+    // AUTH first
+    let auth_cmd = b"*2\r\n$4\r\nAUTH\r\n$32\r\ntest_session_key_32_bytes_long!!\r\n";
+    send_resp_command(&mut stream, auth_cmd).await;
+
+    // LLEN on non-existent list
+    let llen_cmd = b"*2\r\n$4\r\nLLEN\r\n$11\r\nnonexistent\r\n";
+    let response = send_resp_command(&mut stream, llen_cmd).await;
+    assert_eq!(&response, b":0\r\n", "LLEN on empty list should return 0");
+}
