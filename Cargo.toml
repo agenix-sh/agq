@@ -17,9 +17,11 @@ ring = "0.17"
 subtle = "2.5"
 clap = { version = "4.5", features = ["derive"] }
 hex = "0.4"
+redb = "2.1"
 
 [dev-dependencies]
 proptest = "1.4.0"
+tempfile = "3.8"
 
 [profile.release]
 overflow-checks = true
