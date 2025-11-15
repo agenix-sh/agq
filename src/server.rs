@@ -270,10 +270,25 @@ fn handle_auth(
         ));
     }
 
+    // Support both raw bytes and hex-encoded strings for compatibility
+    // If the key looks like hex (64 chars, all hex digits), try to decode it
+    let key_to_compare = if provided_key.len() == 64
+        && provided_key.iter().all(|&b| b.is_ascii_hexdigit())
+    {
+        // Try to decode hex string
+        match hex::decode(provided_key) {
+            Ok(decoded) => decoded,
+            Err(_) => provided_key.clone(), // Fall back to raw bytes if decode fails
+        }
+    } else {
+        // Use raw bytes as-is
+        provided_key.clone()
+    };
+
     // Security: Constant-time comparison to prevent timing attacks
     // Pad to same length for constant-time comparison
-    let max_len = provided_key.len().max(expected_key.len());
-    let mut provided_padded = provided_key.clone();
+    let max_len = key_to_compare.len().max(expected_key.len());
+    let mut provided_padded = key_to_compare;
     let mut expected_padded = expected_key.to_vec();
 
     provided_padded.resize(max_len, 0);
@@ -574,6 +589,27 @@ mod tests {
 
         assert!(result.is_err());
         assert!(!authenticated);
+    }
+
+    #[tokio::test]
+    async fn test_auth_handler_hex_encoded() {
+        let mut authenticated = false;
+        // 32-byte key
+        let session_key = hex::decode("4f90ccd2c864cee924523ec901c450f543753103b3c0da793561b1f9e3eaf579")
+            .unwrap();
+
+        // Client sends hex-encoded string (64 chars)
+        let args = vec![
+            RespValue::BulkString(b"AUTH".to_vec()),
+            RespValue::BulkString(
+                b"4f90ccd2c864cee924523ec901c450f543753103b3c0da793561b1f9e3eaf579".to_vec(),
+            ),
+        ];
+
+        let result = handle_auth(&args, &mut authenticated, &session_key).unwrap();
+
+        assert_eq!(result, RespValue::SimpleString("OK".to_string()));
+        assert!(authenticated);
     }
 
     #[tokio::test]
