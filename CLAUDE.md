@@ -1,0 +1,739 @@
+# CLAUDE.md - AI Agent Development Guidelines
+
+**Repository:** AGQ (Queue Manager)
+**Version:** 0.1
+**Status:** Active
+
+---
+
+## 1. Introduction
+
+This document provides guidelines for AI agents (Claude Code, Codex, and other LLM-based tools) working on the AGQ codebase. AGQ is a security-critical component of the AGX ecosystem, handling job queuing, scheduling, and worker coordination. All development must prioritize security, reliability, and testability.
+
+---
+
+## 2. Development Workflow
+
+### 2.1 Branch Strategy
+
+All work must be done in **issue-specific branches**:
+
+```bash
+# Branch naming convention
+git checkout -b AGQ-XXX-short-description
+
+# Examples:
+git checkout -b AGQ-001-resp-listener
+git checkout -b AGQ-005-zadd-scheduling
+```
+
+### 2.2 Local Development Sessions
+
+**Claude Code** operates in local development sessions:
+
+1. **Start by reading the issue**
+   ```bash
+   gh issue view <issue-number>
+   ```
+
+2. **Understand the context**
+   - Read ARCHITECTURE.md and ROADMAP.md
+   - Review related code and tests
+   - Check dependencies and existing patterns
+
+3. **Plan before coding**
+   - Use TodoWrite to break down the task
+   - Identify security implications
+   - Plan test coverage strategy
+
+4. **Development cycle**
+   - Write tests FIRST (TDD approach)
+   - Implement functionality
+   - Run tests locally
+   - Security review of your own code
+   - Document changes
+
+### 2.3 GitLab Runner Sessions
+
+**Remote CI/CD pipeline** runs on GitLab:
+
+1. Automated test execution
+2. Security scanning (cargo audit, clippy security lints)
+3. Code coverage reporting
+4. Performance benchmarks
+5. Integration test suites
+
+### 2.4 Pull Request Process
+
+1. **Create PR** from issue branch to main
+2. **Automated checks** must pass:
+   - All tests (unit, integration, security)
+   - Linting and formatting
+   - Security audits
+   - Code coverage thresholds (minimum 80%)
+
+3. **Dual AI Review**:
+   - **Claude review**: Architecture, logic, security patterns
+   - **Codex review**: Code quality, idioms, potential bugs
+   - Both must provide approval comments before merge
+
+4. **Human approval** (final gate)
+5. **Merge** with squash or rebase (maintain clean history)
+
+---
+
+## 3. Security Requirements
+
+### 3.1 Security-First Mindset
+
+AGQ handles authentication, job execution, and worker coordination. **Every line of code is security-critical.**
+
+### 3.2 OWASP Top 10 Considerations
+
+#### 3.2.1 Injection Attacks
+- **Command Injection**: Never construct shell commands from user input
+- **SQL/NoSQL Injection**: Sanitize all database queries (even with redb)
+- **RESP Protocol Injection**: Validate and sanitize all RESP messages
+
+```rust
+// ❌ NEVER DO THIS
+let cmd = format!("worker_{}", user_input);
+
+// ✅ DO THIS
+let cmd = format!("worker_{}", sanitize_worker_id(user_input)?);
+```
+
+#### 3.2.2 Authentication & Session Management
+- **Session keys** must be cryptographically random (32+ bytes)
+- Never log session keys
+- Implement key rotation
+- Constant-time comparison for keys
+- Rate limiting on authentication attempts
+
+```rust
+// ✅ Constant-time comparison
+use subtle::ConstantTimeEq;
+if session_key.ct_eq(&provided_key).into() {
+    // authenticated
+}
+```
+
+#### 3.2.3 Sensitive Data Exposure
+- **Never log**:
+  - Session keys
+  - Plan contents (may contain credentials)
+  - Worker registration tokens
+  - Job payloads
+- Use structured logging with explicit field filtering
+- Sanitize error messages (no stack traces to clients)
+
+#### 3.2.4 Resource Exhaustion (DoS)
+- Connection limits per IP
+- Maximum message size limits
+- Job queue depth limits
+- Worker registration rate limits
+- Timeout all blocking operations
+
+```rust
+// ✅ Always set timeouts
+tokio::time::timeout(Duration::from_secs(30), operation).await?
+```
+
+#### 3.2.5 Security Misconfiguration
+- Secure defaults (deny by default)
+- No debug endpoints in production
+- Validate all configuration at startup
+- Fail closed, not open
+
+#### 3.2.6 Deserialization Vulnerabilities
+- Validate JSON schemas strictly
+- Set maximum nesting depth
+- Limit array/object sizes
+- Never use `unsafe` for deserialization
+
+```rust
+// ✅ Strict validation
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct Plan {
+    #[serde(deserialize_with = "validate_plan_id")]
+    id: String,
+    // ...
+}
+```
+
+### 3.3 Rust-Specific Security
+
+#### Memory Safety
+- Minimize `unsafe` blocks (require justification)
+- Document all `unsafe` invariants
+- Use fuzzing for `unsafe` code
+- Prefer safe abstractions
+
+#### Integer Overflow
+- Use checked arithmetic for security-critical calculations
+- Enable overflow checks in release builds
+
+```rust
+// ✅ Checked arithmetic
+let result = a.checked_add(b).ok_or(Error::IntegerOverflow)?;
+```
+
+#### Panic Safety
+- Never panic in production code paths
+- Use `Result` for all fallible operations
+- Document panic conditions in comments
+
+### 3.4 Cryptographic Requirements
+
+- Use `ring` or `rustls` for crypto primitives
+- Never roll your own crypto
+- Use secure random number generation
+- Constant-time operations for secret comparison
+
+```rust
+use ring::rand::{SecureRandom, SystemRandom};
+
+let rng = SystemRandom::new();
+let mut session_key = [0u8; 32];
+rng.fill(&mut session_key)?;
+```
+
+### 3.5 Dependency Security
+
+- Run `cargo audit` before every commit
+- Pin dependencies with `Cargo.lock`
+- Review dependency tree regularly
+- Minimize dependency count
+- Prefer well-audited crates
+
+```bash
+# Required before commit
+cargo audit
+cargo deny check
+```
+
+---
+
+## 4. Testing Requirements
+
+### 4.1 Test-Driven Development (TDD)
+
+**Tests MUST be written before implementation code.**
+
+1. Write failing test
+2. Implement minimal code to pass
+3. Refactor
+4. Repeat
+
+### 4.2 Test Coverage Standards
+
+- **Minimum 80% code coverage** (enforced by CI)
+- **100% coverage** for security-critical code:
+  - Authentication
+  - Authorization
+  - Input validation
+  - Cryptographic operations
+  - RESP protocol parsing
+
+### 4.3 Test Categories
+
+#### 4.3.1 Unit Tests
+```rust
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_session_key_validation() {
+        // Test valid key
+        assert!(validate_session_key("valid_key_here").is_ok());
+
+        // Test invalid key
+        assert!(validate_session_key("").is_err());
+        assert!(validate_session_key("short").is_err());
+    }
+}
+```
+
+#### 4.3.2 Integration Tests
+```rust
+// tests/integration_test.rs
+#[tokio::test]
+async fn test_full_authentication_flow() {
+    let server = start_test_server().await;
+    let client = RespClient::connect("127.0.0.1:6379").await?;
+
+    // Test AUTH command
+    let response = client.auth("test_session_key").await?;
+    assert_eq!(response, "OK");
+
+    // Test authenticated PING
+    let pong = client.ping().await?;
+    assert_eq!(pong, "PONG");
+}
+```
+
+#### 4.3.3 Security Tests
+```rust
+#[test]
+fn test_command_injection_prevention() {
+    let malicious_input = "worker_id; rm -rf /";
+    let result = parse_worker_id(malicious_input);
+    assert!(result.is_err());
+}
+
+#[test]
+fn test_session_key_constant_time_comparison() {
+    // Ensure timing attack resistance
+    let key1 = "a".repeat(32);
+    let key2 = "b".repeat(32);
+
+    let start = Instant::now();
+    let _ = compare_keys(&key1, &key1);
+    let same_duration = start.elapsed();
+
+    let start = Instant::now();
+    let _ = compare_keys(&key1, &key2);
+    let diff_duration = start.elapsed();
+
+    // Timing should be similar (within 10%)
+    let ratio = same_duration.as_nanos() as f64 / diff_duration.as_nanos() as f64;
+    assert!((0.9..=1.1).contains(&ratio));
+}
+```
+
+#### 4.3.4 Fuzzing Tests
+```rust
+// fuzz/fuzz_targets/resp_parser.rs
+#![no_main]
+use libfuzzer_sys::fuzz_target;
+
+fuzz_target!(|data: &[u8]| {
+    // Parser should never panic
+    let _ = parse_resp_message(data);
+});
+```
+
+Run fuzzing:
+```bash
+cargo +nightly fuzz run resp_parser
+```
+
+#### 4.3.5 Property-Based Tests
+```rust
+use proptest::prelude::*;
+
+proptest! {
+    #[test]
+    fn test_job_id_roundtrip(id in "[a-zA-Z0-9]{1,64}") {
+        let encoded = encode_job_id(&id);
+        let decoded = decode_job_id(&encoded)?;
+        assert_eq!(id, decoded);
+    }
+}
+```
+
+#### 4.3.6 Chaos/Failure Tests
+```rust
+#[tokio::test]
+async fn test_network_failure_resilience() {
+    let server = start_test_server().await;
+
+    // Simulate network partition
+    simulate_network_partition();
+
+    // Worker should retry with backoff
+    let worker = Worker::new("test_worker").await;
+    let result = worker.connect_with_retry().await;
+    assert!(result.is_ok());
+}
+```
+
+### 4.4 Test Organization
+
+```
+agq/
+├── src/
+│   ├── lib.rs
+│   ├── auth.rs          // Auth logic
+│   └── auth/
+│       └── tests.rs     // Unit tests for auth
+├── tests/
+│   ├── integration/
+│   │   ├── auth_flow.rs
+│   │   ├── job_lifecycle.rs
+│   │   └── worker_heartbeat.rs
+│   └── security/
+│       ├── injection_tests.rs
+│       ├── dos_tests.rs
+│       └── timing_tests.rs
+└── fuzz/
+    └── fuzz_targets/
+        ├── resp_parser.rs
+        └── plan_deserializer.rs
+```
+
+### 4.5 Testing Checklist (for every PR)
+
+- [ ] All existing tests pass
+- [ ] New tests written for new functionality
+- [ ] Security tests for input validation
+- [ ] Edge cases covered
+- [ ] Error paths tested
+- [ ] Integration tests updated
+- [ ] Fuzzing targets created (if applicable)
+- [ ] Code coverage meets 80% threshold
+- [ ] Security-critical code has 100% coverage
+- [ ] Performance regression tests (if applicable)
+
+---
+
+## 5. Code Quality Standards
+
+### 5.1 Rust Idioms
+
+- Use `Result<T, E>` for fallible operations
+- Use `Option<T>` for nullable values
+- Prefer iterators over loops
+- Use type system for invariants
+- Avoid unwrap/expect in library code
+
+```rust
+// ✅ Good
+fn process_job(job_id: &str) -> Result<JobStatus, Error> {
+    let job = self.jobs.get(job_id)?;
+    job.validate()?;
+    Ok(job.status)
+}
+
+// ❌ Bad
+fn process_job(job_id: &str) -> JobStatus {
+    let job = self.jobs.get(job_id).unwrap();
+    job.status
+}
+```
+
+### 5.2 Error Handling
+
+- Use `thiserror` for error types
+- Provide context with error chain
+- Never swallow errors silently
+- Log errors at appropriate levels
+
+```rust
+use thiserror::Error;
+
+#[derive(Error, Debug)]
+pub enum AgqError {
+    #[error("Invalid session key: {0}")]
+    InvalidSessionKey(String),
+
+    #[error("Database error: {0}")]
+    Database(#[from] redb::Error),
+
+    #[error("Worker {worker_id} not found")]
+    WorkerNotFound { worker_id: String },
+}
+```
+
+### 5.3 Documentation
+
+- Document all public APIs
+- Include examples in doc comments
+- Document security considerations
+- Document panic conditions
+
+```rust
+/// Validates a session key using constant-time comparison.
+///
+/// # Security
+/// This function uses constant-time comparison to prevent timing attacks.
+/// Never use standard equality operators for session keys.
+///
+/// # Arguments
+/// * `provided_key` - The key provided by the client
+/// * `expected_key` - The stored session key
+///
+/// # Returns
+/// `Ok(())` if keys match, `Err(AuthError)` otherwise
+///
+/// # Examples
+/// ```
+/// let result = validate_session_key(client_key, stored_key)?;
+/// ```
+pub fn validate_session_key(provided_key: &[u8], expected_key: &[u8]) -> Result<(), AuthError> {
+    // Implementation
+}
+```
+
+### 5.4 Code Formatting
+
+```bash
+# Run before every commit
+cargo fmt
+cargo clippy -- -D warnings
+cargo clippy -- -W clippy::all -W clippy::pedantic -W clippy::security
+```
+
+---
+
+## 6. AI Agent Responsibilities
+
+### 6.1 When Working on an Issue
+
+1. **Read and understand the full issue**
+2. **Review related architecture docs**
+3. **Plan the implementation** (use TodoWrite)
+4. **Identify security implications**
+5. **Write tests first**
+6. **Implement with security in mind**
+7. **Self-review for vulnerabilities**
+8. **Run all tests locally**
+9. **Document your changes**
+10. **Create PR with detailed description**
+
+### 6.2 Security Self-Review Checklist
+
+Before submitting code, verify:
+
+- [ ] No user input flows to system commands
+- [ ] All input is validated and sanitized
+- [ ] Authentication checks are in place
+- [ ] No secrets in logs or error messages
+- [ ] Timeouts set on all I/O operations
+- [ ] Integer overflow cannot occur
+- [ ] Deserialization is safe and bounded
+- [ ] No `unsafe` code (or justified and documented)
+- [ ] Cryptographic operations use constant-time
+- [ ] Error messages don't leak sensitive data
+- [ ] Resource limits enforced (memory, connections, etc.)
+- [ ] All error paths tested
+
+### 6.3 PR Description Template
+
+When creating a PR, include:
+
+```markdown
+## Issue
+Closes #AGQ-XXX
+
+## Changes
+- Brief description of changes
+- Security considerations addressed
+- Breaking changes (if any)
+
+## Testing
+- Unit tests: X new tests added
+- Integration tests: X scenarios covered
+- Security tests: X attack vectors tested
+- Code coverage: X%
+
+## Security Review
+- [ ] Input validation implemented
+- [ ] No injection vulnerabilities
+- [ ] Authentication/authorization correct
+- [ ] Secrets handling secure
+- [ ] DoS protections in place
+
+## Checklist
+- [ ] Tests pass locally
+- [ ] Code formatted (cargo fmt)
+- [ ] Lints pass (cargo clippy)
+- [ ] Security audit clean (cargo audit)
+- [ ] Documentation updated
+- [ ] CHANGELOG.md updated (if applicable)
+```
+
+### 6.4 Code Review Guidelines (for AI Reviewers)
+
+When reviewing PRs:
+
+1. **Security First**
+   - Check for injection vulnerabilities
+   - Verify authentication/authorization
+   - Review error handling and logging
+   - Check resource limits
+
+2. **Test Coverage**
+   - Verify tests exist for all new code
+   - Check security test coverage
+   - Review edge cases and error paths
+
+3. **Code Quality**
+   - Rust idioms and best practices
+   - Error handling patterns
+   - Documentation completeness
+
+4. **Architecture Alignment**
+   - Consistency with ARCHITECTURE.md
+   - Adherence to separation of concerns
+   - Unix philosophy alignment
+
+5. **Provide Constructive Feedback**
+   ```markdown
+   ## Claude Review
+
+   ### Security
+   - ✅ Input validation looks good
+   - ⚠️ Consider adding rate limiting to AUTH command (DoS risk)
+   - ❌ Session key comparison is not constant-time (line 45)
+
+   ### Testing
+   - ✅ Good unit test coverage (87%)
+   - ⚠️ Missing integration test for worker timeout scenario
+
+   ### Code Quality
+   - ✅ Excellent error handling
+   - ✅ Well documented
+
+   ### Recommendation
+   Address the constant-time comparison issue before merge.
+   ```
+
+---
+
+## 7. Common Patterns
+
+### 7.1 Input Validation Pattern
+
+```rust
+use validator::Validate;
+
+#[derive(Deserialize, Validate)]
+struct JobRequest {
+    #[validate(length(min = 1, max = 64))]
+    #[validate(regex = "^[a-zA-Z0-9_-]+$")]
+    job_id: String,
+
+    #[validate(length(max = 1048576))] // 1MB max
+    payload: String,
+}
+
+fn handle_job_request(req: JobRequest) -> Result<(), Error> {
+    req.validate()?;
+    // Process validated request
+}
+```
+
+### 7.2 Timeout Pattern
+
+```rust
+async fn execute_with_timeout<F, T>(
+    future: F,
+    timeout: Duration,
+) -> Result<T, Error>
+where
+    F: Future<Output = Result<T, Error>>,
+{
+    tokio::time::timeout(timeout, future)
+        .await
+        .map_err(|_| Error::Timeout)?
+}
+```
+
+### 7.3 Rate Limiting Pattern
+
+```rust
+use governor::{Quota, RateLimiter};
+
+struct AuthRateLimiter {
+    limiter: RateLimiter<String, DefaultKeyedStateStore<String>, DefaultClock>,
+}
+
+impl AuthRateLimiter {
+    fn check(&self, ip: &str) -> Result<(), Error> {
+        self.limiter.check_key(&ip.to_string())
+            .map_err(|_| Error::RateLimitExceeded)?;
+        Ok(())
+    }
+}
+```
+
+### 7.4 Structured Logging Pattern
+
+```rust
+use tracing::{info, warn, error, instrument};
+
+#[instrument(skip(session_key))] // Don't log session_key
+async fn authenticate_worker(worker_id: &str, session_key: &[u8]) -> Result<(), Error> {
+    info!(worker_id, "Authenticating worker");
+
+    match validate_session_key(session_key) {
+        Ok(_) => {
+            info!(worker_id, "Authentication successful");
+            Ok(())
+        }
+        Err(e) => {
+            warn!(worker_id, error = %e, "Authentication failed");
+            Err(e)
+        }
+    }
+}
+```
+
+---
+
+## 8. Resources
+
+### Security References
+- [Rust Security Guidelines](https://anssi-fr.github.io/rust-guide/)
+- [OWASP Top 10](https://owasp.org/www-project-top-ten/)
+- [Rust Security Advisory Database](https://rustsec.org/)
+
+### Testing Resources
+- [Rust Testing Guide](https://doc.rust-lang.org/book/ch11-00-testing.html)
+- [cargo-fuzz Documentation](https://rust-fuzz.github.io/book/cargo-fuzz.html)
+- [Proptest Documentation](https://proptest-rs.github.io/proptest/)
+
+### Code Quality
+- [Rust API Guidelines](https://rust-lang.github.io/api-guidelines/)
+- [Clippy Lints](https://rust-lang.github.io/rust-clippy/master/)
+
+---
+
+## 9. Emergency Procedures
+
+### Security Vulnerability Discovered
+
+1. **Do not commit** the vulnerability
+2. **Create private security advisory** on GitLab
+3. **Notify team** immediately
+4. **Develop fix** in private branch
+5. **Test thoroughly**
+6. **Coordinate disclosure**
+
+### Test Failures in CI
+
+1. **Do not merge** until resolved
+2. **Reproduce locally**
+3. **Fix or mark flaky tests**
+4. **Re-run CI**
+
+### Dependency Security Alert
+
+1. **Run `cargo audit` immediately**
+2. **Assess impact**
+3. **Update dependencies**
+4. **Re-test entire suite**
+5. **Deploy patch if critical**
+
+---
+
+## 10. Conclusion
+
+Security and testing are not optional—they are the foundation of AGQ. Every AI agent working on this codebase must internalize these principles:
+
+1. **Security first, always**
+2. **Tests before code**
+3. **No shortcuts**
+4. **Document everything**
+5. **Review thoroughly**
+
+By following these guidelines, we ensure AGQ remains a reliable, secure foundation for the AGX ecosystem.
+
+---
+
+**Last Updated:** 2025-11-15
+**Maintained By:** AGX Core Team
+**Review Cycle:** Quarterly

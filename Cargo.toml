@@ -1,0 +1,27 @@
+[package]
+name = "agq"
+version = "0.1.0"
+edition = "2021"
+authors = ["AGX Core Team"]
+description = "AGQ - Queue Manager for the AGX Agentic Ecosystem"
+license = "MIT OR Apache-2.0"
+
+[dependencies]
+tokio = { version = "1.35", features = ["full"] }
+thiserror = "1.0"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+bytes = "1.5"
+ring = "0.17"
+subtle = "2.5"
+
+[dev-dependencies]
+proptest = "1.4.0"
+
+[profile.release]
+overflow-checks = true
+lto = true
+codegen-units = 1
+
+[profile.dev]
+overflow-checks = true
