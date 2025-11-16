@@ -1,6 +1,7 @@
 //! AGQ - Queue Manager for the AGX Agentic Ecosystem
 //!
-//! A minimal RESP server for handling job queuing and worker coordination.
+//! A minimal RESP server for handling Job queuing and worker coordination.
+//! AGQ stores Plans, creates Jobs, and dispatches them to workers.
 
 pub mod error;
 pub mod resp;
