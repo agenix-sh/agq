@@ -12,6 +12,64 @@ This document provides guidelines for AI agents (Claude Code, Codex, and other L
 
 ---
 
+## 1.1 Execution Layers Nomenclature
+
+**IMPORTANT**: The AGX ecosystem uses **canonical nomenclature** defined in `agx/docs/EXECUTION-LAYERS.md`. All code, documentation, and communication MUST use these exact terms:
+
+### The Five Execution Layers
+
+| Layer | Term | Definition | Created By | Executed By | AGQ Role |
+|-------|------|------------|------------|-------------|----------|
+| 1 | **Task** | Atomic execution unit (single tool/AU call) | AGX | AGW | N/A |
+| 2 | **Plan** | Ordered list of Tasks | AGX | AGW | Stores Plans |
+| 3 | **Job** | Runtime instance of a Plan | AGQ | AGW | Manages Jobs |
+| 4 | **Action** | Many Jobs (same Plan, different inputs) | AGX | AGW (many) | Schedules Actions |
+| 5 | **Workflow** | Multi-Action orchestration (future) | AGX | AGQ/AGW | Future |
+
+### Critical Terminology Rules
+
+**✅ CORRECT:**
+- "A Plan contains Tasks" (not "steps")
+- "AGQ creates Jobs from Plans" (not "job instances")
+- "An Action spawns multiple Jobs" (not "parallel executions")
+- "AGW executes Tasks within a Job" (not "runs steps")
+
+**❌ INCORRECT (Never use):**
+- "Step" → Use **Task**
+- "Job envelope" when referring to Plans → Use **Plan**
+- "Job template" → Use **Plan**
+- "Batch job" → Use **Action**
+
+### AGQ-Specific Responsibilities
+
+Per the spec, AGQ must:
+1. **Store Plans** - Reusable Plan definitions submitted by AGX
+2. **Manage Jobs** - Track runtime state (pending/running/complete/failed)
+3. **Schedule Actions** - Fan-out Jobs from a single Plan with multiple inputs
+4. **Provide Job Status** - Enable AGX to monitor execution
+
+### Required API Endpoints
+
+- `PLAN.SUBMIT` - Store a Plan definition
+- `ACTION.SUBMIT` - Create Jobs from a Plan + inputs
+- `JOB.STATUS` - Query Job execution state
+- `JOB.LIST` - List Jobs for an Action
+
+### When Writing Code
+
+- **Comments**: Use "Task" not "Step"
+- **Variable names**: `task_count` not `step_count`
+- **Function names**: `execute_task()` not `execute_step()`
+- **Struct fields**: `plan.tasks` not `plan.steps`
+- **Error messages**: "Task 3 failed" not "Step 3 failed"
+
+### References
+
+- Authoritative spec: `agx/docs/EXECUTION-LAYERS.md`
+- AGQ alignment tracking: Issue #21 (AGQ-016)
+
+---
+
 ## 2. Development Workflow
 
 ### 2.1 Branch Strategy
