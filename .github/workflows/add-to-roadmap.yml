@@ -1,0 +1,19 @@
+name: Add issues to AGeniX Roadmap
+
+on:
+  issues:
+    types:
+      - opened
+      - reopened
+
+jobs:
+  add-to-project:
+    name: Add issue to AGeniX Roadmap
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/add-to-project@v1.0.2
+        with:
+          # 👇 Use your actual org project URL
+          project-url: https://github.com/orgs/agenix-sh/projects/1
+          # 👇 Use your existing secret with the classic PAT
+          github-token: ${{ secrets.ORG_PROJECT_TOKEN }}
