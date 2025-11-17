@@ -1,0 +1,3 @@
+[submodule "agenix-shared"]
+	path = agenix-shared
+	url = ../agenix.git
