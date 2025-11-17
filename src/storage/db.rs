@@ -598,6 +598,212 @@ impl ListOps for Database {
             }
         }
     }
+
+    fn rpoplpush(&self, source: &str, destination: &str) -> Result<Option<Vec<u8>>> {
+        // Begin atomic write transaction
+        let write_txn = self
+            .db
+            .begin_write()
+            .map_err(|e| Error::Protocol(format!("Failed to begin write transaction: {e}")))?;
+
+        let element = {
+            let mut meta_table = write_txn
+                .open_table(LIST_META_TABLE)
+                .map_err(|e| Error::Protocol(format!("Failed to open list meta table: {e}")))?;
+            let mut data_table = write_txn
+                .open_table(LIST_DATA_TABLE)
+                .map_err(|e| Error::Protocol(format!("Failed to open list data table: {e}")))?;
+
+            // Step 1: RPOP from source
+            // First, read the source metadata and extract values
+            let source_meta = match meta_table.get(source) {
+                Ok(Some(meta_bytes)) => {
+                    let (head, tail) = decode_list_meta(meta_bytes.value())?;
+                    Some((head, tail))
+                }
+                Ok(None) => None,
+                Err(e) => {
+                    return Err(Error::Protocol(format!(
+                        "Failed to read source metadata: {e}"
+                    )));
+                }
+            }; // AccessGuard is dropped here
+
+            let element = if let Some((head, tail)) = source_meta {
+                if head > tail {
+                    // List is empty
+                    debug!("RPOPLPUSH {} {} -> source empty", source, destination);
+                    return Ok(None);
+                }
+
+                // Get tail element
+                let tail_key = list_element_key(source, tail);
+                let element = data_table
+                    .get(tail_key.as_str())
+                    .map_err(|e| Error::Protocol(format!("Failed to get tail element: {e}")))?
+                    .ok_or_else(|| {
+                        Error::Protocol("Tail element not found (data corruption)".to_string())
+                    })?
+                    .value()
+                    .to_vec();
+
+                // Remove tail element
+                data_table
+                    .remove(tail_key.as_str())
+                    .map_err(|e| Error::Protocol(format!("Failed to remove tail element: {e}")))?;
+
+                // Update tail pointer
+                let new_tail = tail - 1;
+                if new_tail < head {
+                    // List is now empty, remove metadata
+                    meta_table.remove(source).map_err(|e| {
+                        Error::Protocol(format!("Failed to remove source metadata: {e}"))
+                    })?;
+                } else {
+                    // Update metadata with new tail
+                    let new_meta = encode_list_meta(head, new_tail);
+                    meta_table.insert(source, &new_meta[..]).map_err(|e| {
+                        Error::Protocol(format!("Failed to update source metadata: {e}"))
+                    })?;
+                }
+
+                Some(element)
+            } else {
+                // Source list doesn't exist
+                debug!("RPOPLPUSH {} {} -> source empty", source, destination);
+                return Ok(None);
+            };
+
+            // Step 2: If we got an element, LPUSH to destination
+            if let Some(ref element) = element {
+                // Read destination metadata first
+                let dest_meta = match meta_table.get(destination) {
+                    Ok(Some(meta_bytes)) => {
+                        let (head, tail) = decode_list_meta(meta_bytes.value())?;
+                        (head, tail)
+                    }
+                    Ok(None) => (0i64, -1i64), // New list
+                    Err(e) => {
+                        return Err(Error::Protocol(format!(
+                            "Failed to read destination metadata: {e}"
+                        )));
+                    }
+                }; // AccessGuard is dropped here
+
+                let (head, tail) = dest_meta;
+
+                // Calculate new head index
+                let new_head = head
+                    .checked_sub(1)
+                    .ok_or_else(|| Error::Protocol("Head index underflow".to_string()))?;
+
+                // Insert element at new head
+                let head_key = list_element_key(destination, new_head);
+                data_table
+                    .insert(head_key.as_str(), element.as_slice())
+                    .map_err(|e| Error::Protocol(format!("Failed to insert at head: {e}")))?;
+
+                // Update destination metadata
+                let new_meta = encode_list_meta(new_head, tail);
+                meta_table
+                    .insert(destination, &new_meta[..])
+                    .map_err(|e| Error::Protocol(format!("Failed to update dest metadata: {e}")))?;
+            }
+
+            element
+        };
+
+        // Commit the transaction atomically
+        write_txn
+            .commit()
+            .map_err(|e| Error::Protocol(format!("Failed to commit transaction: {e}")))?;
+
+        // Notify any BRPOP/BRPOPLPUSH waiters on the destination list
+        if element.is_some() {
+            if let Ok(notifiers) = self.list_notifiers.lock() {
+                if let Some(notify) = notifiers.get(destination) {
+                    notify.notify_waiters();
+                }
+            }
+        }
+
+        debug!(
+            "RPOPLPUSH {} {} -> {} bytes",
+            source,
+            destination,
+            element.as_ref().map_or(0, |e| e.len())
+        );
+
+        Ok(element)
+    }
+
+    async fn brpoplpush(
+        &self,
+        source: &str,
+        destination: &str,
+        timeout_secs: u64,
+    ) -> Result<Option<Vec<u8>>> {
+        let start = std::time::Instant::now();
+        let timeout_duration = if timeout_secs > 0 {
+            Some(Duration::from_secs(timeout_secs))
+        } else {
+            None
+        };
+
+        // Get or create notifier for source list
+        let notifier = {
+            let mut notifiers = self
+                .list_notifiers
+                .lock()
+                .map_err(|_| Error::Protocol("Failed to acquire notifier lock".to_string()))?;
+            notifiers
+                .entry(source.to_string())
+                .or_insert_with(|| Arc::new(Notify::new()))
+                .clone()
+        };
+
+        loop {
+            // Try non-blocking rpoplpush
+            if let Some(element) = self.rpoplpush(source, destination)? {
+                debug!(
+                    "BRPOPLPUSH {} {} -> {} bytes (immediate)",
+                    source,
+                    destination,
+                    element.len()
+                );
+                return Ok(Some(element));
+            }
+
+            // Check if we've exceeded timeout
+            if let Some(timeout) = timeout_duration {
+                let elapsed = start.elapsed();
+                if elapsed >= timeout {
+                    debug!(
+                        "BRPOPLPUSH {} {} -> timeout after {:?}",
+                        source, destination, elapsed
+                    );
+                    return Ok(None);
+                }
+
+                // Wait for notification or timeout
+                let remaining = timeout - elapsed;
+                tokio::select! {
+                    _ = notifier.notified() => {
+                        // New data might be available, loop to try again
+                        continue;
+                    }
+                    _ = sleep(remaining) => {
+                        debug!("BRPOPLPUSH {} {} -> timeout", source, destination);
+                        return Ok(None);
+                    }
+                }
+            } else {
+                // No timeout, wait indefinitely
+                notifier.notified().await;
+                // Loop to try again
+            }
+        }
+    }
 }
 
 impl SortedSetOps for Database {
@@ -1361,6 +1567,214 @@ mod tests {
         assert_eq!(value, Some(b"delayed".to_vec()));
         // Should complete in ~500ms, not 5 seconds
         assert!(elapsed < std::time::Duration::from_secs(1));
+    }
+
+    #[test]
+    fn test_rpoplpush_basic() {
+        let (db, _temp) = test_db();
+
+        // Push elements to source list
+        db.lpush("source", b"first").unwrap();
+        db.lpush("source", b"second").unwrap();
+        db.lpush("source", b"third").unwrap();
+
+        // RPOPLPUSH moves tail element from source to head of destination
+        let element = db.rpoplpush("source", "dest").unwrap();
+        assert_eq!(element, Some(b"first".to_vec()));
+
+        // Verify source list
+        assert_eq!(db.llen("source").unwrap(), 2);
+        assert_eq!(
+            db.lrange("source", 0, -1).unwrap(),
+            vec![b"third".to_vec(), b"second".to_vec()]
+        );
+
+        // Verify destination list
+        assert_eq!(db.llen("dest").unwrap(), 1);
+        assert_eq!(db.lrange("dest", 0, -1).unwrap(), vec![b"first".to_vec()]);
+
+        // Move another element
+        let element = db.rpoplpush("source", "dest").unwrap();
+        assert_eq!(element, Some(b"second".to_vec()));
+
+        assert_eq!(
+            db.lrange("dest", 0, -1).unwrap(),
+            vec![b"second".to_vec(), b"first".to_vec()]
+        );
+    }
+
+    #[test]
+    fn test_rpoplpush_empty_source() {
+        let (db, _temp) = test_db();
+
+        // RPOPLPUSH from empty list returns None
+        let element = db.rpoplpush("empty", "dest").unwrap();
+        assert_eq!(element, None);
+
+        // Destination should still be empty
+        assert_eq!(db.llen("dest").unwrap(), 0);
+    }
+
+    #[test]
+    fn test_rpoplpush_same_list() {
+        let (db, _temp) = test_db();
+
+        // Push elements
+        db.lpush("list", b"a").unwrap();
+        db.lpush("list", b"b").unwrap();
+        db.lpush("list", b"c").unwrap();
+
+        // RPOPLPUSH to same list (rotates list)
+        let element = db.rpoplpush("list", "list").unwrap();
+        assert_eq!(element, Some(b"a".to_vec()));
+
+        // List should be rotated: [a, c, b]
+        assert_eq!(
+            db.lrange("list", 0, -1).unwrap(),
+            vec![b"a".to_vec(), b"c".to_vec(), b"b".to_vec()]
+        );
+        assert_eq!(db.llen("list").unwrap(), 3);
+    }
+
+    #[test]
+    fn test_rpoplpush_atomicity() {
+        let (db, _temp) = test_db();
+
+        // Push elements to source
+        db.lpush("source", b"element").unwrap();
+
+        // RPOPLPUSH should be atomic - element is either in source OR dest, never both or neither
+        let element = db.rpoplpush("source", "dest").unwrap();
+        assert_eq!(element, Some(b"element".to_vec()));
+
+        // Verify element moved atomically
+        assert_eq!(db.llen("source").unwrap(), 0);
+        assert_eq!(db.llen("dest").unwrap(), 1);
+        assert_eq!(db.lrange("dest", 0, -1).unwrap(), vec![b"element".to_vec()]);
+    }
+
+    #[test]
+    fn test_rpoplpush_last_element() {
+        let (db, _temp) = test_db();
+
+        // Single element
+        db.lpush("source", b"only").unwrap();
+
+        let element = db.rpoplpush("source", "dest").unwrap();
+        assert_eq!(element, Some(b"only".to_vec()));
+
+        // Source should be empty
+        assert_eq!(db.llen("source").unwrap(), 0);
+
+        // Destination should have the element
+        assert_eq!(db.llen("dest").unwrap(), 1);
+
+        // Subsequent RPOPLPUSH should return None
+        let element = db.rpoplpush("source", "dest").unwrap();
+        assert_eq!(element, None);
+    }
+
+    #[tokio::test]
+    async fn test_brpoplpush_immediate() {
+        let (db, _temp) = test_db();
+
+        // Push elements to source
+        db.lpush("source", b"data").unwrap();
+
+        // BRPOPLPUSH should return immediately if source has data
+        let start = std::time::Instant::now();
+        let element = db.brpoplpush("source", "dest", 5).await.unwrap();
+        let elapsed = start.elapsed();
+
+        assert_eq!(element, Some(b"data".to_vec()));
+        assert!(elapsed < std::time::Duration::from_millis(100));
+
+        // Verify atomic move
+        assert_eq!(db.llen("source").unwrap(), 0);
+        assert_eq!(db.llen("dest").unwrap(), 1);
+    }
+
+    #[tokio::test]
+    async fn test_brpoplpush_timeout() {
+        let (db, _temp) = test_db();
+
+        // BRPOPLPUSH on empty list with 1 second timeout
+        let start = std::time::Instant::now();
+        let element = db.brpoplpush("empty", "dest", 1).await.unwrap();
+        let elapsed = start.elapsed();
+
+        assert_eq!(element, None);
+        assert!(elapsed >= std::time::Duration::from_secs(1));
+        assert!(elapsed < std::time::Duration::from_millis(1500));
+
+        // Destination should still be empty
+        assert_eq!(db.llen("dest").unwrap(), 0);
+    }
+
+    #[tokio::test]
+    async fn test_brpoplpush_notification() {
+        let (db, _temp) = test_db();
+        let db = std::sync::Arc::new(db);
+
+        // Spawn task that will push to source after 500ms
+        let db_clone = db.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+            db_clone.lpush("source", b"delayed").unwrap();
+        });
+
+        // BRPOPLPUSH should wake up when element is pushed
+        let start = std::time::Instant::now();
+        let element = db.brpoplpush("source", "dest", 5).await.unwrap();
+        let elapsed = start.elapsed();
+
+        assert_eq!(element, Some(b"delayed".to_vec()));
+        // Should complete in ~500ms, not 5 seconds
+        assert!(elapsed < std::time::Duration::from_secs(1));
+
+        // Verify atomic move
+        assert_eq!(db.llen("source").unwrap(), 0);
+        assert_eq!(db.llen("dest").unwrap(), 1);
+        assert_eq!(db.lrange("dest", 0, -1).unwrap(), vec![b"delayed".to_vec()]);
+    }
+
+    #[test]
+    fn test_rpoplpush_reliable_queue_pattern() {
+        let (db, _temp) = test_db();
+
+        // Simulate reliable queue pattern: ready -> processing
+        db.lpush("queue:ready", b"job1").unwrap();
+        db.lpush("queue:ready", b"job2").unwrap();
+        db.lpush("queue:ready", b"job3").unwrap();
+
+        // Worker picks up job atomically
+        let job = db.rpoplpush("queue:ready", "queue:processing").unwrap();
+        assert_eq!(job, Some(b"job1".to_vec()));
+
+        // Verify job moved to processing queue
+        assert_eq!(db.llen("queue:ready").unwrap(), 2);
+        assert_eq!(db.llen("queue:processing").unwrap(), 1);
+
+        // On success, remove from processing queue
+        assert_eq!(db.rpop("queue:processing").unwrap(), Some(b"job1".to_vec()));
+
+        // On failure, move back to ready queue for retry
+        let job2 = db
+            .rpoplpush("queue:ready", "queue:processing")
+            .unwrap()
+            .unwrap();
+        assert_eq!(job2, b"job2");
+
+        // Simulate worker crash - job still in processing queue
+        // Recovery: move job back to ready
+        let recovered = db.rpoplpush("queue:processing", "queue:ready").unwrap();
+        assert_eq!(recovered, Some(b"job2".to_vec()));
+
+        // Job is back in ready queue for retry
+        assert_eq!(
+            db.lrange("queue:ready", 0, -1).unwrap(),
+            vec![b"job2".to_vec(), b"job3".to_vec()]
+        );
     }
 
     // Sorted Set Tests
