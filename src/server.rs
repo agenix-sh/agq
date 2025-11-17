@@ -442,6 +442,17 @@ fn handle_get(args: &[RespValue], db: &Database) -> Result<RespValue> {
     }
 }
 
+/// Get current Unix timestamp in seconds
+///
+/// # Errors
+/// Returns an error if system time is before Unix epoch
+fn get_current_timestamp_secs() -> Result<u64> {
+    Ok(std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_err(|e| Error::Protocol(format!("System time error: {e}")))?
+        .as_secs())
+}
+
 /// Handle SET command
 ///
 /// Syntax: SET key value [EX seconds] [PX milliseconds] [EXAT unix-time-seconds] [PXAT unix-time-milliseconds]
@@ -460,6 +471,9 @@ fn handle_set(args: &[RespValue], db: &Database) -> Result<RespValue> {
         ));
     };
 
+    // Maximum expiry duration: 10 years (prevents resource exhaustion)
+    const MAX_EXPIRY_SECONDS: u64 = 365 * 24 * 60 * 60 * 10;
+
     // Parse optional expiry arguments
     let mut expire_at: Option<u64> = None;
     let mut i = 3;
@@ -475,12 +489,21 @@ fn handle_set(args: &[RespValue], db: &Database) -> Result<RespValue> {
                     Error::InvalidArguments("EX value must be an integer".to_string())
                 })?;
 
-                let now = std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .map_err(|e| Error::Protocol(format!("System time error: {e}")))?
-                    .as_secs();
+                // Validate bounds to prevent overflow and resource exhaustion
+                if seconds > MAX_EXPIRY_SECONDS {
+                    return Err(Error::InvalidArguments(
+                        "Expiry time too far in future (max 10 years)".to_string(),
+                    ));
+                }
 
-                expire_at = Some(now + seconds);
+                let now = get_current_timestamp_secs()?;
+
+                // Use checked arithmetic to prevent overflow
+                let expire_time = now
+                    .checked_add(seconds)
+                    .ok_or_else(|| Error::InvalidArguments("Expiry time overflow".to_string()))?;
+
+                expire_at = Some(expire_time);
                 i += 2;
             }
             "PX" => {
@@ -492,12 +515,22 @@ fn handle_set(args: &[RespValue], db: &Database) -> Result<RespValue> {
                     Error::InvalidArguments("PX value must be an integer".to_string())
                 })?;
 
-                let now = std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .map_err(|e| Error::Protocol(format!("System time error: {e}")))?
-                    .as_secs();
+                // Convert to seconds for validation
+                let seconds = millis / 1000;
+                if seconds > MAX_EXPIRY_SECONDS {
+                    return Err(Error::InvalidArguments(
+                        "Expiry time too far in future (max 10 years)".to_string(),
+                    ));
+                }
 
-                expire_at = Some(now + (millis / 1000));
+                let now = get_current_timestamp_secs()?;
+
+                // Use checked arithmetic to prevent overflow
+                let expire_time = now
+                    .checked_add(seconds)
+                    .ok_or_else(|| Error::InvalidArguments("Expiry time overflow".to_string()))?;
+
+                expire_at = Some(expire_time);
                 i += 2;
             }
             "EXAT" => {
@@ -508,6 +541,14 @@ fn handle_set(args: &[RespValue], db: &Database) -> Result<RespValue> {
                 let timestamp: u64 = args[i + 1].as_string()?.parse().map_err(|_| {
                     Error::InvalidArguments("EXAT value must be an integer".to_string())
                 })?;
+
+                // Validate timestamp is reasonable (not more than 10 years in future)
+                let now = get_current_timestamp_secs()?;
+                if timestamp > now + MAX_EXPIRY_SECONDS {
+                    return Err(Error::InvalidArguments(
+                        "Expiry timestamp too far in future (max 10 years)".to_string(),
+                    ));
+                }
 
                 expire_at = Some(timestamp);
                 i += 2;
@@ -521,7 +562,16 @@ fn handle_set(args: &[RespValue], db: &Database) -> Result<RespValue> {
                     Error::InvalidArguments("PXAT value must be an integer".to_string())
                 })?;
 
-                expire_at = Some(timestamp_millis / 1000);
+                // Convert to seconds and validate
+                let timestamp = timestamp_millis / 1000;
+                let now = get_current_timestamp_secs()?;
+                if timestamp > now + MAX_EXPIRY_SECONDS {
+                    return Err(Error::InvalidArguments(
+                        "Expiry timestamp too far in future (max 10 years)".to_string(),
+                    ));
+                }
+
+                expire_at = Some(timestamp);
                 i += 2;
             }
             _ => {

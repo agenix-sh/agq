@@ -146,7 +146,12 @@ impl StringOps for Database {
         // Check if key has expired
         if let Ok(Some(expire_bytes)) = expiry_table.get(key) {
             if expire_bytes.value().len() == 8 {
-                let expire_at = u64::from_le_bytes(expire_bytes.value().try_into().unwrap());
+                let expire_at = u64::from_le_bytes(
+                    expire_bytes
+                        .value()
+                        .try_into()
+                        .map_err(|_| Error::Protocol("Invalid expiry format".to_string()))?,
+                );
                 let now = std::time::SystemTime::now()
                     .duration_since(std::time::UNIX_EPOCH)
                     .map_err(|e| Error::Protocol(format!("System time error: {e}")))?
@@ -323,7 +328,12 @@ impl StringOps for Database {
                 if expire_bytes.value().len() != 8 {
                     return Err(Error::Protocol("Invalid expiry time format".to_string()));
                 }
-                let expire_at = u64::from_le_bytes(expire_bytes.value().try_into().unwrap());
+                let expire_at = u64::from_le_bytes(
+                    expire_bytes
+                        .value()
+                        .try_into()
+                        .map_err(|_| Error::Protocol("Invalid expiry format".to_string()))?,
+                );
 
                 // Get current time
                 let now = std::time::SystemTime::now()
@@ -332,8 +342,37 @@ impl StringOps for Database {
                     .as_secs();
 
                 if expire_at <= now {
-                    // Key has expired
-                    debug!("TTL {} -> expired (should be cleaned up)", key);
+                    // Key has expired - perform lazy cleanup
+                    debug!("TTL {} -> expired (cleaning up)", key);
+
+                    // Drop read transaction before opening write transaction
+                    drop(expiry_table);
+                    drop(kv_table);
+                    drop(read_txn);
+
+                    // Clean up expired key
+                    let write_txn = self.db.begin_write().map_err(|e| {
+                        Error::Protocol(format!("Failed to begin write transaction: {e}"))
+                    })?;
+                    {
+                        let mut kv_table = write_txn.open_table(KV_TABLE).map_err(|e| {
+                            Error::Protocol(format!("Failed to open KV table: {e}"))
+                        })?;
+                        let mut expiry_table = write_txn.open_table(EXPIRY_TABLE).map_err(|e| {
+                            Error::Protocol(format!("Failed to open expiry table: {e}"))
+                        })?;
+
+                        kv_table.remove(key).map_err(|e| {
+                            Error::Protocol(format!("Failed to remove expired key: {e}"))
+                        })?;
+                        expiry_table.remove(key).map_err(|e| {
+                            Error::Protocol(format!("Failed to remove expiry entry: {e}"))
+                        })?;
+                    }
+                    write_txn
+                        .commit()
+                        .map_err(|e| Error::Protocol(format!("Failed to commit cleanup: {e}")))?;
+
                     Ok(Some(-2)) // Redis convention: -2 for expired keys
                 } else {
                     let ttl = (expire_at - now) as i64;

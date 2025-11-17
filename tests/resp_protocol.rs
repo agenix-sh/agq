@@ -1694,3 +1694,91 @@ async fn test_set_overwrites_expiry() {
     let response = send_resp_command(&mut stream, ttl_cmd).await;
     assert_eq!(&response, b":-1\r\n", "SET without expiry should clear TTL");
 }
+
+// ============================================================================
+// Security Tests for Expiry (Overflow, Bounds Checking)
+// ============================================================================
+
+#[tokio::test]
+async fn test_set_ex_too_large_rejected() {
+    let (_handle, port) = start_test_server().await;
+    let mut stream = TcpStream::connect(format!("127.0.0.1:{port}"))
+        .await
+        .expect("Failed to connect");
+
+    // Authenticate
+    let auth_cmd = b"*2\r\n$4\r\nAUTH\r\n$32\r\ntest_session_key_32_bytes_long!!\r\n";
+    send_resp_command(&mut stream, auth_cmd).await;
+
+    // Try to set key with expiry > 10 years (should be rejected)
+    // 10 years = 315360000 seconds, use 999999999999 (way over limit)
+    let set_cmd =
+        b"*5\r\n$3\r\nSET\r\n$7\r\ntestkey\r\n$5\r\nvalue\r\n$2\r\nEX\r\n$12\r\n999999999999\r\n";
+    let response = send_resp_command(&mut stream, set_cmd).await;
+
+    // Should return error
+    assert!(
+        response.starts_with(b"-ERR"),
+        "SET with excessive EX should be rejected"
+    );
+}
+
+#[tokio::test]
+async fn test_set_exat_too_far_future_rejected() {
+    let (_handle, port) = start_test_server().await;
+    let mut stream = TcpStream::connect(format!("127.0.0.1:{port}"))
+        .await
+        .expect("Failed to connect");
+
+    // Authenticate
+    let auth_cmd = b"*2\r\n$4\r\nAUTH\r\n$32\r\ntest_session_key_32_bytes_long!!\r\n";
+    send_resp_command(&mut stream, auth_cmd).await;
+
+    // Try to set key with EXAT timestamp way in the future (should be rejected)
+    // Use u64::MAX as string
+    let set_cmd = b"*5\r\n$3\r\nSET\r\n$7\r\ntestkey\r\n$5\r\nvalue\r\n$4\r\nEXAT\r\n$20\r\n18446744073709551615\r\n";
+    let response = send_resp_command(&mut stream, set_cmd).await;
+
+    // Should return error
+    assert!(
+        response.starts_with(b"-ERR"),
+        "SET with excessive EXAT should be rejected"
+    );
+}
+
+#[tokio::test]
+async fn test_ttl_cleanup_expired_key() {
+    let (_handle, port) = start_test_server().await;
+    let mut stream = TcpStream::connect(format!("127.0.0.1:{port}"))
+        .await
+        .expect("Failed to connect");
+
+    // Authenticate
+    let auth_cmd = b"*2\r\n$4\r\nAUTH\r\n$32\r\ntest_session_key_32_bytes_long!!\r\n";
+    send_resp_command(&mut stream, auth_cmd).await;
+
+    // SET key with EX 1 (expires in 1 second)
+    let set_cmd = b"*5\r\n$3\r\nSET\r\n$7\r\ntestkey\r\n$5\r\nvalue\r\n$2\r\nEX\r\n$1\r\n1\r\n";
+    send_resp_command(&mut stream, set_cmd).await;
+
+    // Wait for expiry
+    tokio::time::sleep(tokio::time::Duration::from_secs(2)).await;
+
+    // Call TTL (should trigger lazy cleanup and return -2)
+    let ttl_cmd = b"*2\r\n$3\r\nTTL\r\n$7\r\ntestkey\r\n";
+    let response = send_resp_command(&mut stream, ttl_cmd).await;
+    assert_eq!(&response, b":-2\r\n", "TTL should clean up expired key");
+
+    // Call TTL again - key should still be gone (cleanup was successful)
+    let ttl_cmd = b"*2\r\n$3\r\nTTL\r\n$7\r\ntestkey\r\n";
+    let response = send_resp_command(&mut stream, ttl_cmd).await;
+    assert_eq!(
+        &response, b":-2\r\n",
+        "TTL should still return -2 after cleanup"
+    );
+
+    // GET should also return nil
+    let get_cmd = b"*2\r\n$3\r\nGET\r\n$7\r\ntestkey\r\n";
+    let response = send_resp_command(&mut stream, get_cmd).await;
+    assert_eq!(&response, b"$-1\r\n", "GET should return nil after cleanup");
+}
