@@ -86,3 +86,100 @@ pub trait ListOps {
     /// Returns an error if the database operation fails.
     fn lrange(&self, key: &str, start: i64, stop: i64) -> Result<Vec<Vec<u8>>>;
 }
+
+/// Storage operations for sorted set data
+///
+/// Sorted sets store members with associated scores, ordered by score.
+/// Used for scheduling Jobs based on execution time.
+pub trait SortedSetOps {
+    /// Add a member with a score to a sorted set
+    ///
+    /// # Arguments
+    /// * `key` - The sorted set key
+    /// * `score` - The score (typically a Unix timestamp for scheduling)
+    /// * `member` - The member value (typically a Job ID)
+    ///
+    /// # Returns
+    /// Number of new elements added (0 if member already existed, 1 if new)
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the database operation fails.
+    fn zadd(&self, key: &str, score: f64, member: &[u8]) -> Result<u64>;
+
+    /// Get a range of members by index (sorted by score, low to high)
+    ///
+    /// # Arguments
+    /// * `key` - The sorted set key
+    /// * `start` - Start index (0-based, negative counts from end)
+    /// * `stop` - Stop index (inclusive, negative counts from end)
+    ///
+    /// # Returns
+    /// Vector of (member, score) tuples
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the database operation fails.
+    fn zrange(&self, key: &str, start: i64, stop: i64) -> Result<Vec<(Vec<u8>, f64)>>;
+
+    /// Get members by score range
+    ///
+    /// # Arguments
+    /// * `key` - The sorted set key
+    /// * `min_score` - Minimum score (inclusive)
+    /// * `max_score` - Maximum score (inclusive)
+    ///
+    /// # Returns
+    /// Vector of (member, score) tuples with scores in range [min_score, max_score]
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the database operation fails.
+    fn zrangebyscore(
+        &self,
+        key: &str,
+        min_score: f64,
+        max_score: f64,
+    ) -> Result<Vec<(Vec<u8>, f64)>>;
+
+    /// Remove a member from a sorted set
+    ///
+    /// # Arguments
+    /// * `key` - The sorted set key
+    /// * `member` - The member to remove
+    ///
+    /// # Returns
+    /// 1 if member was removed, 0 if member didn't exist
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the database operation fails.
+    fn zrem(&self, key: &str, member: &[u8]) -> Result<u64>;
+
+    /// Get the score of a member
+    ///
+    /// # Arguments
+    /// * `key` - The sorted set key
+    /// * `member` - The member to look up
+    ///
+    /// # Returns
+    /// Some(score) if member exists, None otherwise
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the database operation fails.
+    fn zscore(&self, key: &str, member: &[u8]) -> Result<Option<f64>>;
+
+    /// Get the cardinality (number of members) of a sorted set
+    ///
+    /// # Arguments
+    /// * `key` - The sorted set key
+    ///
+    /// # Returns
+    /// Number of members in the sorted set
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the database operation fails.
+    fn zcard(&self, key: &str) -> Result<u64>;
+}
