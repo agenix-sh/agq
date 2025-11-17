@@ -2,7 +2,7 @@
 
 **Version:** 1.0
 **Status:** Canonical Reference
-**Authority:** Based on `agx/docs/EXECUTION-LAYERS.md`
+**Authority:** Based on `agenix/docs/architecture/execution-layers.md`
 
 ---
 
@@ -187,7 +187,8 @@ Per the canonical spec, AGQ must:
 
 ## References
 
-- **Authoritative spec:** `agx/docs/EXECUTION-LAYERS.md`
+- **Authoritative spec:** `agenix/docs/architecture/execution-layers.md` (canonical source)
+- **Local stub:** `agx/docs/EXECUTION-LAYERS.md` (links to canonical)
 - **Alignment tracking:** AGQ Issue #21 (AGQ-016)
 - **AI agent guidelines:** `CLAUDE.md` section 1.1
 
@@ -195,10 +196,11 @@ Per the canonical spec, AGQ must:
 
 ## Changelog
 
+- **2025-11-17**: Updated references to point to agenix canonical location
 - **2025-11-15**: Initial version (AGQ-016 Phase 1)
 
 ---
 
 **Maintained by:** AGX Core Team
 **Review cycle:** Quarterly
-**Questions?** Consult `agx/docs/EXECUTION-LAYERS.md`
+**Questions?** Consult `agenix/docs/architecture/execution-layers.md`
