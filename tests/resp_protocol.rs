@@ -1489,3 +1489,208 @@ async fn test_brpoplpush_invalid_timeout() {
         "BRPOPLPUSH with invalid timeout should error"
     );
 }
+
+// ============================================================================
+// Key Expiry Tests (SET EX, TTL)
+// ============================================================================
+
+#[tokio::test]
+async fn test_set_with_ex_option() {
+    let (_handle, port) = start_test_server().await;
+    let mut stream = TcpStream::connect(format!("127.0.0.1:{port}"))
+        .await
+        .expect("Failed to connect");
+
+    // Authenticate
+    let auth_cmd = b"*2\r\n$4\r\nAUTH\r\n$32\r\ntest_session_key_32_bytes_long!!\r\n";
+    send_resp_command(&mut stream, auth_cmd).await;
+
+    // SET key with EX 10 (expires in 10 seconds)
+    let set_cmd = b"*5\r\n$3\r\nSET\r\n$7\r\ntestkey\r\n$5\r\nvalue\r\n$2\r\nEX\r\n$2\r\n10\r\n";
+    let response = send_resp_command(&mut stream, set_cmd).await;
+    assert_eq!(&response, b"+OK\r\n", "SET with EX should return OK");
+
+    // GET should return the value
+    let get_cmd = b"*2\r\n$3\r\nGET\r\n$7\r\ntestkey\r\n";
+    let response = send_resp_command(&mut stream, get_cmd).await;
+    assert_eq!(&response, b"$5\r\nvalue\r\n", "GET should return value");
+
+    // TTL should return positive value (between 1 and 10)
+    let ttl_cmd = b"*2\r\n$3\r\nTTL\r\n$7\r\ntestkey\r\n";
+    let response = send_resp_command(&mut stream, ttl_cmd).await;
+    // Response format: :<number>\r\n
+    assert!(response.starts_with(b":"), "TTL should return integer");
+    let ttl_str = std::str::from_utf8(&response[1..response.len() - 2]).unwrap();
+    let ttl: i64 = ttl_str.parse().unwrap();
+    assert!(
+        ttl > 0 && ttl <= 10,
+        "TTL should be between 1 and 10, got {}",
+        ttl
+    );
+}
+
+#[tokio::test]
+async fn test_set_with_px_option() {
+    let (_handle, port) = start_test_server().await;
+    let mut stream = TcpStream::connect(format!("127.0.0.1:{port}"))
+        .await
+        .expect("Failed to connect");
+
+    // Authenticate
+    let auth_cmd = b"*2\r\n$4\r\nAUTH\r\n$32\r\ntest_session_key_32_bytes_long!!\r\n";
+    send_resp_command(&mut stream, auth_cmd).await;
+
+    // SET key with PX 5000 (expires in 5000 milliseconds = 5 seconds)
+    let set_cmd = b"*5\r\n$3\r\nSET\r\n$7\r\ntestkey\r\n$5\r\nvalue\r\n$2\r\nPX\r\n$4\r\n5000\r\n";
+    let response = send_resp_command(&mut stream, set_cmd).await;
+    assert_eq!(&response, b"+OK\r\n", "SET with PX should return OK");
+
+    // TTL should return approximately 5 seconds
+    let ttl_cmd = b"*2\r\n$3\r\nTTL\r\n$7\r\ntestkey\r\n";
+    let response = send_resp_command(&mut stream, ttl_cmd).await;
+    let ttl_str = std::str::from_utf8(&response[1..response.len() - 2]).unwrap();
+    let ttl: i64 = ttl_str.parse().unwrap();
+    assert!(
+        ttl > 0 && ttl <= 5,
+        "TTL should be between 1 and 5, got {}",
+        ttl
+    );
+}
+
+#[tokio::test]
+async fn test_worker_heartbeat_pattern() {
+    let (_handle, port) = start_test_server().await;
+    let mut stream = TcpStream::connect(format!("127.0.0.1:{port}"))
+        .await
+        .expect("Failed to connect");
+
+    // Authenticate
+    let auth_cmd = b"*2\r\n$4\r\nAUTH\r\n$32\r\ntest_session_key_32_bytes_long!!\r\n";
+    send_resp_command(&mut stream, auth_cmd).await;
+
+    // Worker registration: SET worker:w1:alive 1 EX 10
+    let set_cmd =
+        b"*5\r\n$3\r\nSET\r\n$15\r\nworker:w1:alive\r\n$1\r\n1\r\n$2\r\nEX\r\n$2\r\n10\r\n";
+    let response = send_resp_command(&mut stream, set_cmd).await;
+    assert_eq!(
+        &response, b"+OK\r\n",
+        "Worker heartbeat registration should succeed"
+    );
+
+    // Check worker is alive
+    let get_cmd = b"*2\r\n$3\r\nGET\r\n$15\r\nworker:w1:alive\r\n";
+    let response = send_resp_command(&mut stream, get_cmd).await;
+    assert_eq!(&response, b"$1\r\n1\r\n", "Worker should be alive");
+
+    // Check TTL
+    let ttl_cmd = b"*2\r\n$3\r\nTTL\r\n$15\r\nworker:w1:alive\r\n";
+    let response = send_resp_command(&mut stream, ttl_cmd).await;
+    let ttl_str = std::str::from_utf8(&response[1..response.len() - 2]).unwrap();
+    let ttl: i64 = ttl_str.parse().unwrap();
+    assert!(ttl > 0 && ttl <= 10, "Worker heartbeat TTL should be set");
+}
+
+#[tokio::test]
+async fn test_ttl_no_expiry() {
+    let (_handle, port) = start_test_server().await;
+    let mut stream = TcpStream::connect(format!("127.0.0.1:{port}"))
+        .await
+        .expect("Failed to connect");
+
+    // Authenticate
+    let auth_cmd = b"*2\r\n$4\r\nAUTH\r\n$32\r\ntest_session_key_32_bytes_long!!\r\n";
+    send_resp_command(&mut stream, auth_cmd).await;
+
+    // SET key without expiry
+    let set_cmd = b"*3\r\n$3\r\nSET\r\n$7\r\ntestkey\r\n$5\r\nvalue\r\n";
+    send_resp_command(&mut stream, set_cmd).await;
+
+    // TTL should return -1 (no expiry)
+    let ttl_cmd = b"*2\r\n$3\r\nTTL\r\n$7\r\ntestkey\r\n";
+    let response = send_resp_command(&mut stream, ttl_cmd).await;
+    assert_eq!(
+        &response, b":-1\r\n",
+        "TTL should return -1 for keys without expiry"
+    );
+}
+
+#[tokio::test]
+async fn test_ttl_nonexistent_key() {
+    let (_handle, port) = start_test_server().await;
+    let mut stream = TcpStream::connect(format!("127.0.0.1:{port}"))
+        .await
+        .expect("Failed to connect");
+
+    // Authenticate
+    let auth_cmd = b"*2\r\n$4\r\nAUTH\r\n$32\r\ntest_session_key_32_bytes_long!!\r\n";
+    send_resp_command(&mut stream, auth_cmd).await;
+
+    // TTL of non-existent key should return -2
+    let ttl_cmd = b"*2\r\n$3\r\nTTL\r\n$11\r\nnonexistent\r\n";
+    let response = send_resp_command(&mut stream, ttl_cmd).await;
+    assert_eq!(
+        &response, b":-2\r\n",
+        "TTL should return -2 for non-existent keys"
+    );
+}
+
+#[tokio::test]
+async fn test_expired_key_returns_nil() {
+    let (_handle, port) = start_test_server().await;
+    let mut stream = TcpStream::connect(format!("127.0.0.1:{port}"))
+        .await
+        .expect("Failed to connect");
+
+    // Authenticate
+    let auth_cmd = b"*2\r\n$4\r\nAUTH\r\n$32\r\ntest_session_key_32_bytes_long!!\r\n";
+    send_resp_command(&mut stream, auth_cmd).await;
+
+    // SET key with EX 1 (expires in 1 second)
+    let set_cmd = b"*5\r\n$3\r\nSET\r\n$7\r\ntestkey\r\n$5\r\nvalue\r\n$2\r\nEX\r\n$1\r\n1\r\n";
+    send_resp_command(&mut stream, set_cmd).await;
+
+    // Wait for key to expire
+    tokio::time::sleep(tokio::time::Duration::from_secs(2)).await;
+
+    // GET should return nil
+    let get_cmd = b"*2\r\n$3\r\nGET\r\n$7\r\ntestkey\r\n";
+    let response = send_resp_command(&mut stream, get_cmd).await;
+    assert_eq!(&response, b"$-1\r\n", "Expired key should return nil");
+
+    // TTL should return -2 (key expired)
+    let ttl_cmd = b"*2\r\n$3\r\nTTL\r\n$7\r\ntestkey\r\n";
+    let response = send_resp_command(&mut stream, ttl_cmd).await;
+    assert_eq!(&response, b":-2\r\n", "TTL of expired key should return -2");
+}
+
+#[tokio::test]
+async fn test_set_overwrites_expiry() {
+    let (_handle, port) = start_test_server().await;
+    let mut stream = TcpStream::connect(format!("127.0.0.1:{port}"))
+        .await
+        .expect("Failed to connect");
+
+    // Authenticate
+    let auth_cmd = b"*2\r\n$4\r\nAUTH\r\n$32\r\ntest_session_key_32_bytes_long!!\r\n";
+    send_resp_command(&mut stream, auth_cmd).await;
+
+    // SET key with expiry
+    let set_cmd = b"*5\r\n$3\r\nSET\r\n$7\r\ntestkey\r\n$5\r\nvalue\r\n$2\r\nEX\r\n$2\r\n10\r\n";
+    send_resp_command(&mut stream, set_cmd).await;
+
+    // Verify TTL is set
+    let ttl_cmd = b"*2\r\n$3\r\nTTL\r\n$7\r\ntestkey\r\n";
+    let response = send_resp_command(&mut stream, ttl_cmd).await;
+    let ttl_str = std::str::from_utf8(&response[1..response.len() - 2]).unwrap();
+    let ttl: i64 = ttl_str.parse().unwrap();
+    assert!(ttl > 0, "TTL should be positive");
+
+    // SET again without expiry
+    let set_cmd2 = b"*3\r\n$3\r\nSET\r\n$7\r\ntestkey\r\n$8\r\nnewvalue\r\n";
+    send_resp_command(&mut stream, set_cmd2).await;
+
+    // TTL should now be -1 (no expiry)
+    let ttl_cmd = b"*2\r\n$3\r\nTTL\r\n$7\r\ntestkey\r\n";
+    let response = send_resp_command(&mut stream, ttl_cmd).await;
+    assert_eq!(&response, b":-1\r\n", "SET without expiry should clear TTL");
+}
