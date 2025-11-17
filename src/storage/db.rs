@@ -1,6 +1,6 @@
 //! Database wrapper for redb embedded storage
 
-use crate::storage::{ListOps, SortedSetOps, StringOps};
+use crate::storage::{HashOps, ListOps, SortedSetOps, StringOps};
 use crate::{Error, Result};
 use async_trait::async_trait;
 use redb::{Database as RedbDatabase, ReadableTable, TableDefinition};
@@ -30,6 +30,10 @@ const ZSET_MEMBER_TABLE: TableDefinition<&str, &[u8]> = TableDefinition::new("zs
 /// Key: "{zset_name}:{score_bytes}:{member}", Value: empty
 /// The score is encoded as a sortable byte representation
 const ZSET_SCORE_TABLE: TableDefinition<&str, &[u8]> = TableDefinition::new("zset_score");
+
+/// Table for hash field-value storage
+/// Key: "{hash_name}:{field}", Value: field value bytes
+const HASH_TABLE: TableDefinition<&str, &[u8]> = TableDefinition::new("hash");
 
 /// AGQ Database wrapper
 ///
@@ -89,6 +93,9 @@ impl Database {
             let _zset_score_table = write_txn
                 .open_table(ZSET_SCORE_TABLE)
                 .map_err(|e| Error::Protocol(format!("Failed to open zset score table: {e}")))?;
+            let _hash_table = write_txn
+                .open_table(HASH_TABLE)
+                .map_err(|e| Error::Protocol(format!("Failed to open hash table: {e}")))?;
         }
         write_txn
             .commit()
@@ -304,6 +311,12 @@ fn parse_score_key(key_str: &str, zset_prefix_len: usize) -> Result<(Vec<u8>, f6
         .map_err(|_| Error::Protocol("Invalid member hex encoding".to_string()))?;
 
     Ok((member, score))
+}
+
+/// Helper function for hash operations
+/// Create hash field key: "{hash}:{field}"
+fn hash_field_key(hash: &str, field: &str) -> String {
+    format!("{}:{}", hash, field)
 }
 
 #[async_trait]
@@ -865,6 +878,177 @@ impl SortedSetOps for Database {
         }
 
         debug!("ZCARD {} -> {}", key, count);
+        Ok(count)
+    }
+}
+
+impl HashOps for Database {
+    fn hset(&self, key: &str, field: &str, value: &[u8]) -> Result<u64> {
+        let write_txn = self
+            .db
+            .begin_write()
+            .map_err(|e| Error::Protocol(format!("Failed to begin write transaction: {e}")))?;
+
+        let is_new = {
+            let mut table = write_txn
+                .open_table(HASH_TABLE)
+                .map_err(|e| Error::Protocol(format!("Failed to open hash table: {e}")))?;
+
+            let field_key = hash_field_key(key, field);
+
+            // Check if field already exists
+            let is_new = table
+                .get(field_key.as_str())
+                .map_err(|e| Error::Protocol(format!("Failed to check field: {e}")))?
+                .is_none();
+
+            table
+                .insert(field_key.as_str(), value)
+                .map_err(|e| Error::Protocol(format!("Failed to set field: {e}")))?;
+
+            u64::from(is_new)
+        };
+
+        write_txn
+            .commit()
+            .map_err(|e| Error::Protocol(format!("Failed to commit transaction: {e}")))?;
+
+        debug!("HSET {} {} -> new: {}", key, field, is_new);
+        Ok(is_new)
+    }
+
+    fn hget(&self, key: &str, field: &str) -> Result<Option<Vec<u8>>> {
+        let read_txn = self
+            .db
+            .begin_read()
+            .map_err(|e| Error::Protocol(format!("Failed to begin read transaction: {e}")))?;
+
+        let table = read_txn
+            .open_table(HASH_TABLE)
+            .map_err(|e| Error::Protocol(format!("Failed to open hash table: {e}")))?;
+
+        let field_key = hash_field_key(key, field);
+
+        match table.get(field_key.as_str()) {
+            Ok(Some(value)) => {
+                let bytes = value.value().to_vec();
+                debug!("HGET {} {} -> {} bytes", key, field, bytes.len());
+                Ok(Some(bytes))
+            }
+            Ok(None) => {
+                debug!("HGET {} {} -> (nil)", key, field);
+                Ok(None)
+            }
+            Err(e) => Err(Error::Protocol(format!("Failed to get field: {e}"))),
+        }
+    }
+
+    fn hdel(&self, key: &str, field: &str) -> Result<u64> {
+        let write_txn = self
+            .db
+            .begin_write()
+            .map_err(|e| Error::Protocol(format!("Failed to begin write transaction: {e}")))?;
+
+        let deleted = {
+            let mut table = write_txn
+                .open_table(HASH_TABLE)
+                .map_err(|e| Error::Protocol(format!("Failed to open hash table: {e}")))?;
+
+            let field_key = hash_field_key(key, field);
+
+            let result = table
+                .remove(field_key.as_str())
+                .map_err(|e| Error::Protocol(format!("Failed to delete field: {e}")))?;
+            u64::from(result.is_some())
+        };
+
+        write_txn
+            .commit()
+            .map_err(|e| Error::Protocol(format!("Failed to commit transaction: {e}")))?;
+
+        debug!("HDEL {} {} -> deleted: {}", key, field, deleted);
+        Ok(deleted)
+    }
+
+    fn hgetall(&self, key: &str) -> Result<Vec<(String, Vec<u8>)>> {
+        let read_txn = self
+            .db
+            .begin_read()
+            .map_err(|e| Error::Protocol(format!("Failed to begin read transaction: {e}")))?;
+
+        let table = read_txn
+            .open_table(HASH_TABLE)
+            .map_err(|e| Error::Protocol(format!("Failed to open hash table: {e}")))?;
+
+        // Use range query for O(M) performance where M = fields in this hash
+        let start_key = format!("{}:", key);
+        let end_key = format!("{};", key); // ';' is ASCII next after ':'
+        let mut fields: Vec<(String, Vec<u8>)> = Vec::new();
+
+        for item in table
+            .range(start_key.as_str()..end_key.as_str())
+            .map_err(|e| Error::Protocol(format!("Failed to create range query: {e}")))?
+        {
+            let (k, v) = item.map_err(|e| Error::Protocol(format!("Failed to read field: {e}")))?;
+            let key_str = k.value();
+
+            // Extract field name from "{hash}:{field}"
+            if let Some(field) = key_str.strip_prefix(&start_key) {
+                fields.push((field.to_string(), v.value().to_vec()));
+            }
+        }
+
+        debug!("HGETALL {} -> {} fields", key, fields.len());
+        Ok(fields)
+    }
+
+    fn hexists(&self, key: &str, field: &str) -> Result<bool> {
+        let read_txn = self
+            .db
+            .begin_read()
+            .map_err(|e| Error::Protocol(format!("Failed to begin read transaction: {e}")))?;
+
+        let table = read_txn
+            .open_table(HASH_TABLE)
+            .map_err(|e| Error::Protocol(format!("Failed to open hash table: {e}")))?;
+
+        let field_key = hash_field_key(key, field);
+
+        let exists = table
+            .get(field_key.as_str())
+            .map_err(|e| Error::Protocol(format!("Failed to check field: {e}")))?
+            .is_some();
+
+        debug!("HEXISTS {} {} -> {}", key, field, exists);
+        Ok(exists)
+    }
+
+    fn hlen(&self, key: &str) -> Result<u64> {
+        let read_txn = self
+            .db
+            .begin_read()
+            .map_err(|e| Error::Protocol(format!("Failed to begin read transaction: {e}")))?;
+
+        let table = read_txn
+            .open_table(HASH_TABLE)
+            .map_err(|e| Error::Protocol(format!("Failed to open hash table: {e}")))?;
+
+        // Use range query for O(M) performance
+        let start_key = format!("{}:", key);
+        let end_key = format!("{};", key);
+        let mut count = 0u64;
+
+        for item in table
+            .range(start_key.as_str()..end_key.as_str())
+            .map_err(|e| Error::Protocol(format!("Failed to create range query: {e}")))?
+        {
+            let _ = item.map_err(|e| Error::Protocol(format!("Failed to read field: {e}")))?;
+            count = count
+                .checked_add(1)
+                .ok_or_else(|| Error::Protocol("Count overflow".to_string()))?;
+        }
+
+        debug!("HLEN {} -> {}", key, count);
         Ok(count)
     }
 }
@@ -1465,6 +1649,239 @@ mod tests {
             members.len(),
             0,
             "Invalid negative range should return empty"
+        );
+    }
+
+    // Hash Tests
+
+    #[test]
+    fn test_hset_and_hget() {
+        let (db, _temp) = test_db();
+
+        // Set first field
+        let is_new = db.hset("job:123", "status", b"pending").unwrap();
+        assert_eq!(is_new, 1, "Should return 1 for new field");
+
+        // Update existing field
+        let is_new = db.hset("job:123", "status", b"running").unwrap();
+        assert_eq!(is_new, 0, "Should return 0 for update");
+
+        // Get field
+        let value = db.hget("job:123", "status").unwrap();
+        assert_eq!(value, Some(b"running".to_vec()));
+
+        // Get nonexistent field
+        let value = db.hget("job:123", "nonexistent").unwrap();
+        assert_eq!(value, None);
+    }
+
+    #[test]
+    fn test_hset_multiple_fields() {
+        let (db, _temp) = test_db();
+
+        db.hset("job:123", "status", b"running").unwrap();
+        db.hset("job:123", "stdout", b"output data").unwrap();
+        db.hset("job:123", "stderr", b"error data").unwrap();
+
+        assert_eq!(
+            db.hget("job:123", "status").unwrap(),
+            Some(b"running".to_vec())
+        );
+        assert_eq!(
+            db.hget("job:123", "stdout").unwrap(),
+            Some(b"output data".to_vec())
+        );
+        assert_eq!(
+            db.hget("job:123", "stderr").unwrap(),
+            Some(b"error data".to_vec())
+        );
+    }
+
+    #[test]
+    fn test_hdel() {
+        let (db, _temp) = test_db();
+
+        db.hset("job:123", "status", b"pending").unwrap();
+        db.hset("job:123", "stdout", b"output").unwrap();
+
+        // Delete existing field
+        let deleted = db.hdel("job:123", "status").unwrap();
+        assert_eq!(deleted, 1);
+
+        // Verify deletion
+        assert_eq!(db.hget("job:123", "status").unwrap(), None);
+        assert_eq!(
+            db.hget("job:123", "stdout").unwrap(),
+            Some(b"output".to_vec())
+        );
+
+        // Delete nonexistent field
+        let deleted = db.hdel("job:123", "nonexistent").unwrap();
+        assert_eq!(deleted, 0);
+    }
+
+    #[test]
+    fn test_hexists() {
+        let (db, _temp) = test_db();
+
+        db.hset("job:123", "status", b"pending").unwrap();
+
+        assert!(db.hexists("job:123", "status").unwrap());
+        assert!(!db.hexists("job:123", "nonexistent").unwrap());
+        assert!(!db.hexists("job:999", "status").unwrap());
+    }
+
+    #[test]
+    fn test_hlen() {
+        let (db, _temp) = test_db();
+
+        // Empty hash
+        assert_eq!(db.hlen("job:123").unwrap(), 0);
+
+        // Add fields
+        db.hset("job:123", "status", b"pending").unwrap();
+        assert_eq!(db.hlen("job:123").unwrap(), 1);
+
+        db.hset("job:123", "stdout", b"output").unwrap();
+        db.hset("job:123", "stderr", b"error").unwrap();
+        assert_eq!(db.hlen("job:123").unwrap(), 3);
+
+        // Update field (shouldn't change length)
+        db.hset("job:123", "status", b"running").unwrap();
+        assert_eq!(db.hlen("job:123").unwrap(), 3);
+
+        // Delete field
+        db.hdel("job:123", "stderr").unwrap();
+        assert_eq!(db.hlen("job:123").unwrap(), 2);
+    }
+
+    #[test]
+    fn test_hgetall() {
+        let (db, _temp) = test_db();
+
+        // Empty hash
+        let fields = db.hgetall("job:123").unwrap();
+        assert_eq!(fields.len(), 0);
+
+        // Add fields
+        db.hset("job:123", "status", b"running").unwrap();
+        db.hset("job:123", "stdout", b"output data").unwrap();
+        db.hset("job:123", "stderr", b"error data").unwrap();
+
+        let fields = db.hgetall("job:123").unwrap();
+        assert_eq!(fields.len(), 3);
+
+        // Convert to HashMap for easier testing
+        let field_map: std::collections::HashMap<String, Vec<u8>> = fields.into_iter().collect();
+
+        assert_eq!(field_map.get("status"), Some(&b"running".to_vec()));
+        assert_eq!(field_map.get("stdout"), Some(&b"output data".to_vec()));
+        assert_eq!(field_map.get("stderr"), Some(&b"error data".to_vec()));
+    }
+
+    #[test]
+    fn test_hash_isolation() {
+        let (db, _temp) = test_db();
+
+        // Set fields in two different hashes
+        db.hset("job:123", "status", b"pending").unwrap();
+        db.hset("job:456", "status", b"running").unwrap();
+
+        // Verify isolation
+        assert_eq!(
+            db.hget("job:123", "status").unwrap(),
+            Some(b"pending".to_vec())
+        );
+        assert_eq!(
+            db.hget("job:456", "status").unwrap(),
+            Some(b"running".to_vec())
+        );
+
+        assert_eq!(db.hlen("job:123").unwrap(), 1);
+        assert_eq!(db.hlen("job:456").unwrap(), 1);
+
+        // Delete from one shouldn't affect the other
+        db.hdel("job:123", "status").unwrap();
+        assert_eq!(db.hget("job:123", "status").unwrap(), None);
+        assert_eq!(
+            db.hget("job:456", "status").unwrap(),
+            Some(b"running".to_vec())
+        );
+    }
+
+    #[test]
+    fn test_hash_with_binary_data() {
+        let (db, _temp) = test_db();
+
+        let binary_data = vec![0u8, 1, 2, 255, 254, 253];
+        db.hset("job:123", "data", &binary_data).unwrap();
+
+        let value = db.hget("job:123", "data").unwrap();
+        assert_eq!(value, Some(binary_data));
+    }
+
+    #[test]
+    fn test_hash_field_names_with_colons() {
+        let (db, _temp) = test_db();
+
+        // Field names with colons should work
+        db.hset("job:123", "meta:created_at", b"2023-01-01")
+            .unwrap();
+        db.hset("job:123", "meta:updated_at", b"2023-01-02")
+            .unwrap();
+
+        assert_eq!(
+            db.hget("job:123", "meta:created_at").unwrap(),
+            Some(b"2023-01-01".to_vec())
+        );
+        assert_eq!(
+            db.hget("job:123", "meta:updated_at").unwrap(),
+            Some(b"2023-01-02".to_vec())
+        );
+
+        let fields = db.hgetall("job:123").unwrap();
+        assert_eq!(fields.len(), 2);
+    }
+
+    #[test]
+    fn test_hash_job_metadata_use_case() {
+        let (db, _temp) = test_db();
+
+        // Simulate storing job metadata
+        let job_id = "job:abc123";
+
+        db.hset(job_id, "status", b"pending").unwrap();
+        db.hset(job_id, "plan_id", b"plan:xyz789").unwrap();
+        db.hset(job_id, "created_at", b"1700000000").unwrap();
+        db.hset(job_id, "started_at", b"").unwrap(); // Empty initially
+
+        // Check job status
+        assert_eq!(
+            db.hget(job_id, "status").unwrap(),
+            Some(b"pending".to_vec())
+        );
+
+        // Update when job starts
+        db.hset(job_id, "status", b"running").unwrap();
+        db.hset(job_id, "started_at", b"1700000060").unwrap();
+
+        // Add output
+        db.hset(job_id, "stdout", b"Task started\nProcessing...")
+            .unwrap();
+        db.hset(job_id, "stderr", b"").unwrap();
+
+        // Verify all fields
+        let all_fields = db.hgetall(job_id).unwrap();
+        assert_eq!(all_fields.len(), 6);
+
+        // Job completes
+        db.hset(job_id, "status", b"completed").unwrap();
+        db.hset(job_id, "completed_at", b"1700000120").unwrap();
+
+        assert_eq!(db.hlen(job_id).unwrap(), 7);
+        assert_eq!(
+            db.hget(job_id, "status").unwrap(),
+            Some(b"completed".to_vec())
         );
     }
 }
