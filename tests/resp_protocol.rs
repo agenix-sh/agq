@@ -1172,3 +1172,12 @@ async fn test_hash_large_values() {
         "Should return correct bulk string length"
     );
 }
+
+// Note: The storage layer has limits on field value sizes (10MB) to prevent DoS attacks.
+// This is thoroughly tested in unit tests (test_hash_field_value_size_limit in storage/db.rs)
+// Integration testing of the 10MB limit is not practical here because:
+// 1. The RESP parser has its own message size limits
+// 2. The test helper uses a 1KB buffer which cannot handle multi-MB messages
+// 3. Testing large values is more appropriate at the storage layer
+//
+// The test_hash_large_values test above verifies 100KB values work correctly.
