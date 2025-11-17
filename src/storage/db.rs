@@ -35,6 +35,10 @@ const ZSET_SCORE_TABLE: TableDefinition<&str, &[u8]> = TableDefinition::new("zse
 /// Key: "{hash_name}:{field}", Value: field value bytes
 const HASH_TABLE: TableDefinition<&str, &[u8]> = TableDefinition::new("hash");
 
+/// Table for key expiry times
+/// Key: key name, Value: Unix timestamp (seconds) as 8 bytes (u64)
+const EXPIRY_TABLE: TableDefinition<&str, &[u8]> = TableDefinition::new("expiry");
+
 /// Maximum number of fields allowed in a single hash
 /// Prevents DoS attacks through unbounded hash growth
 const MAX_HASH_FIELDS: u64 = 10_000;
@@ -93,6 +97,9 @@ impl Database {
             let _kv_table = write_txn
                 .open_table(KV_TABLE)
                 .map_err(|e| Error::Protocol(format!("Failed to open KV table: {e}")))?;
+            let _expiry_table = write_txn
+                .open_table(EXPIRY_TABLE)
+                .map_err(|e| Error::Protocol(format!("Failed to open expiry table: {e}")))?;
             let _list_meta_table = write_txn
                 .open_table(LIST_META_TABLE)
                 .map_err(|e| Error::Protocol(format!("Failed to open list meta table: {e}")))?;
@@ -129,11 +136,36 @@ impl StringOps for Database {
             .begin_read()
             .map_err(|e| Error::Protocol(format!("Failed to begin read transaction: {e}")))?;
 
-        let table = read_txn
+        let kv_table = read_txn
             .open_table(KV_TABLE)
             .map_err(|e| Error::Protocol(format!("Failed to open KV table: {e}")))?;
+        let expiry_table = read_txn
+            .open_table(EXPIRY_TABLE)
+            .map_err(|e| Error::Protocol(format!("Failed to open expiry table: {e}")))?;
 
-        match table.get(key) {
+        // Check if key has expired
+        if let Ok(Some(expire_bytes)) = expiry_table.get(key) {
+            if expire_bytes.value().len() == 8 {
+                let expire_at = u64::from_le_bytes(
+                    expire_bytes
+                        .value()
+                        .try_into()
+                        .map_err(|_| Error::Protocol("Invalid expiry format".to_string()))?,
+                );
+                let now = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map_err(|e| Error::Protocol(format!("System time error: {e}")))?
+                    .as_secs();
+
+                if expire_at <= now {
+                    // Key has expired, return None (lazy expiration)
+                    debug!("GET {} -> (expired)", key);
+                    return Ok(None);
+                }
+            }
+        }
+
+        match kv_table.get(key) {
             Ok(Some(value)) => {
                 let bytes = value.value().to_vec();
                 debug!("GET {} -> {} bytes", key, bytes.len());
@@ -154,13 +186,19 @@ impl StringOps for Database {
             .map_err(|e| Error::Protocol(format!("Failed to begin write transaction: {e}")))?;
 
         {
-            let mut table = write_txn
+            let mut kv_table = write_txn
                 .open_table(KV_TABLE)
                 .map_err(|e| Error::Protocol(format!("Failed to open KV table: {e}")))?;
+            let mut expiry_table = write_txn
+                .open_table(EXPIRY_TABLE)
+                .map_err(|e| Error::Protocol(format!("Failed to open expiry table: {e}")))?;
 
-            table
+            kv_table
                 .insert(key, value)
                 .map_err(|e| Error::Protocol(format!("Failed to insert key: {e}")))?;
+
+            // Remove any existing expiry entry (SET without expiry clears expiration)
+            let _ = expiry_table.remove(key);
         }
 
         write_txn
@@ -178,13 +216,20 @@ impl StringOps for Database {
             .map_err(|e| Error::Protocol(format!("Failed to begin write transaction: {e}")))?;
 
         let deleted = {
-            let mut table = write_txn
+            let mut kv_table = write_txn
                 .open_table(KV_TABLE)
                 .map_err(|e| Error::Protocol(format!("Failed to open KV table: {e}")))?;
+            let mut expiry_table = write_txn
+                .open_table(EXPIRY_TABLE)
+                .map_err(|e| Error::Protocol(format!("Failed to open expiry table: {e}")))?;
 
-            let result = table
+            let result = kv_table
                 .remove(key)
                 .map_err(|e| Error::Protocol(format!("Failed to delete key: {e}")))?;
+
+            // Also remove expiry entry if it exists
+            let _ = expiry_table.remove(key);
+
             result.is_some()
         };
 
@@ -202,17 +247,174 @@ impl StringOps for Database {
             .begin_read()
             .map_err(|e| Error::Protocol(format!("Failed to begin read transaction: {e}")))?;
 
-        let table = read_txn
+        let kv_table = read_txn
             .open_table(KV_TABLE)
             .map_err(|e| Error::Protocol(format!("Failed to open KV table: {e}")))?;
+        let expiry_table = read_txn
+            .open_table(EXPIRY_TABLE)
+            .map_err(|e| Error::Protocol(format!("Failed to open expiry table: {e}")))?;
 
-        let exists = table
+        // Check if key exists in KV table
+        let key_exists = kv_table
             .get(key)
             .map_err(|e| Error::Protocol(format!("Failed to check key: {e}")))?
             .is_some();
 
-        debug!("EXISTS {} -> {}", key, exists);
-        Ok(exists)
+        if !key_exists {
+            debug!("EXISTS {} -> false (not found)", key);
+            return Ok(false);
+        }
+
+        // Check if key has expired
+        if let Ok(Some(expire_bytes)) = expiry_table.get(key) {
+            if expire_bytes.value().len() == 8 {
+                let expire_at = u64::from_le_bytes(
+                    expire_bytes
+                        .value()
+                        .try_into()
+                        .map_err(|_| Error::Protocol("Invalid expiry format".to_string()))?,
+                );
+                let now = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map_err(|e| Error::Protocol(format!("System time error: {e}")))?
+                    .as_secs();
+
+                if expire_at <= now {
+                    // Key has expired, return false (lazy expiration check)
+                    debug!("EXISTS {} -> false (expired)", key);
+                    return Ok(false);
+                }
+            }
+        }
+
+        debug!("EXISTS {} -> true", key);
+        Ok(true)
+    }
+
+    fn setex(&self, key: &str, value: &[u8], expire_at: u64) -> Result<()> {
+        let write_txn = self
+            .db
+            .begin_write()
+            .map_err(|e| Error::Protocol(format!("Failed to begin write transaction: {e}")))?;
+
+        {
+            let mut kv_table = write_txn
+                .open_table(KV_TABLE)
+                .map_err(|e| Error::Protocol(format!("Failed to open KV table: {e}")))?;
+            let mut expiry_table = write_txn
+                .open_table(EXPIRY_TABLE)
+                .map_err(|e| Error::Protocol(format!("Failed to open expiry table: {e}")))?;
+
+            // Set the key-value pair
+            kv_table
+                .insert(key, value)
+                .map_err(|e| Error::Protocol(format!("Failed to insert key: {e}")))?;
+
+            // Set the expiry time
+            let expire_bytes = expire_at.to_le_bytes();
+            expiry_table
+                .insert(key, &expire_bytes[..])
+                .map_err(|e| Error::Protocol(format!("Failed to set expiry: {e}")))?;
+        }
+
+        write_txn
+            .commit()
+            .map_err(|e| Error::Protocol(format!("Failed to commit transaction: {e}")))?;
+
+        debug!(
+            "SETEX {} -> {} bytes, expires at {}",
+            key,
+            value.len(),
+            expire_at
+        );
+        Ok(())
+    }
+
+    fn ttl(&self, key: &str) -> Result<Option<i64>> {
+        let read_txn = self
+            .db
+            .begin_read()
+            .map_err(|e| Error::Protocol(format!("Failed to begin read transaction: {e}")))?;
+
+        let kv_table = read_txn
+            .open_table(KV_TABLE)
+            .map_err(|e| Error::Protocol(format!("Failed to open KV table: {e}")))?;
+        let expiry_table = read_txn
+            .open_table(EXPIRY_TABLE)
+            .map_err(|e| Error::Protocol(format!("Failed to open expiry table: {e}")))?;
+
+        // Check if key exists
+        if kv_table
+            .get(key)
+            .map_err(|e| Error::Protocol(format!("Failed to check key: {e}")))?
+            .is_none()
+        {
+            // Key doesn't exist
+            return Ok(None);
+        }
+
+        // Check if it has an expiry time
+        match expiry_table.get(key) {
+            Ok(Some(expire_bytes)) => {
+                if expire_bytes.value().len() != 8 {
+                    return Err(Error::Protocol("Invalid expiry time format".to_string()));
+                }
+                let expire_at = u64::from_le_bytes(
+                    expire_bytes
+                        .value()
+                        .try_into()
+                        .map_err(|_| Error::Protocol("Invalid expiry format".to_string()))?,
+                );
+
+                // Get current time
+                let now = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map_err(|e| Error::Protocol(format!("System time error: {e}")))?
+                    .as_secs();
+
+                if expire_at <= now {
+                    // Key has expired - perform lazy cleanup
+                    debug!("TTL {} -> expired (cleaning up)", key);
+
+                    // Drop read transaction before opening write transaction
+                    drop(expiry_table);
+                    drop(kv_table);
+                    drop(read_txn);
+
+                    // Clean up expired key (idempotent - safe if key already deleted)
+                    let write_txn = self.db.begin_write().map_err(|e| {
+                        Error::Protocol(format!("Failed to begin write transaction: {e}"))
+                    })?;
+                    {
+                        let mut kv_table = write_txn.open_table(KV_TABLE).map_err(|e| {
+                            Error::Protocol(format!("Failed to open KV table: {e}"))
+                        })?;
+                        let mut expiry_table = write_txn.open_table(EXPIRY_TABLE).map_err(|e| {
+                            Error::Protocol(format!("Failed to open expiry table: {e}"))
+                        })?;
+
+                        // Idempotent removes - ignore if key doesn't exist
+                        let _ = kv_table.remove(key);
+                        let _ = expiry_table.remove(key);
+                    }
+                    write_txn
+                        .commit()
+                        .map_err(|e| Error::Protocol(format!("Failed to commit cleanup: {e}")))?;
+
+                    Ok(Some(-2)) // Redis convention: -2 for expired keys
+                } else {
+                    let ttl = (expire_at - now) as i64;
+                    debug!("TTL {} -> {} seconds", key, ttl);
+                    Ok(Some(ttl))
+                }
+            }
+            Ok(None) => {
+                // Key exists but has no expiry
+                debug!("TTL {} -> no expiry", key);
+                Ok(Some(-1)) // Redis convention: -1 for keys without expiry
+            }
+            Err(e) => Err(Error::Protocol(format!("Failed to get expiry: {e}"))),
+        }
     }
 }
 
@@ -1417,6 +1619,131 @@ mod tests {
 
         let value = db.get("binary").unwrap();
         assert_eq!(value, Some(binary_data));
+    }
+
+    #[test]
+    fn test_setex_and_get() {
+        let (db, _temp) = test_db();
+
+        // Set key with expiry 10 seconds in the future
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        let expire_at = now + 10;
+
+        db.setex("key1", b"value1", expire_at).unwrap();
+
+        // Key should exist and be retrievable
+        let value = db.get("key1").unwrap();
+        assert_eq!(value, Some(b"value1".to_vec()));
+
+        // TTL should be positive (between 0 and 10 seconds)
+        let ttl = db.ttl("key1").unwrap();
+        assert!(ttl.is_some());
+        let ttl_value = ttl.unwrap();
+        assert!(ttl_value > 0 && ttl_value <= 10);
+    }
+
+    #[test]
+    fn test_setex_expiry() {
+        let (db, _temp) = test_db();
+
+        // Set key with expiry in the past (already expired)
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        let expire_at = now - 1; // 1 second in the past
+
+        db.setex("key1", b"value1", expire_at).unwrap();
+
+        // Key should not be retrievable (expired)
+        let value = db.get("key1").unwrap();
+        assert_eq!(value, None);
+
+        // TTL should be -2 (key expired/doesn't exist)
+        let ttl = db.ttl("key1").unwrap();
+        assert_eq!(ttl, Some(-2));
+    }
+
+    #[test]
+    fn test_ttl_no_expiry() {
+        let (db, _temp) = test_db();
+
+        // Set key without expiry
+        db.set("key1", b"value1").unwrap();
+
+        // TTL should be -1 (no expiry)
+        let ttl = db.ttl("key1").unwrap();
+        assert_eq!(ttl, Some(-1));
+    }
+
+    #[test]
+    fn test_ttl_nonexistent() {
+        let (db, _temp) = test_db();
+
+        // TTL of non-existent key should be None
+        let ttl = db.ttl("nonexistent").unwrap();
+        assert_eq!(ttl, None);
+    }
+
+    #[test]
+    fn test_del_removes_expiry() {
+        let (db, _temp) = test_db();
+
+        // Set key with expiry
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        let expire_at = now + 10;
+
+        db.setex("key1", b"value1", expire_at).unwrap();
+
+        // Verify key exists
+        assert!(db.exists("key1").unwrap());
+
+        // Delete key
+        let deleted = db.del("key1").unwrap();
+        assert!(deleted);
+
+        // Key should not exist
+        assert!(!db.exists("key1").unwrap());
+
+        // TTL should return None (key doesn't exist)
+        let ttl = db.ttl("key1").unwrap();
+        assert_eq!(ttl, None);
+    }
+
+    #[test]
+    fn test_set_overwrites_expiry() {
+        let (db, _temp) = test_db();
+
+        // Set key with expiry
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        let expire_at = now + 10;
+
+        db.setex("key1", b"value1", expire_at).unwrap();
+
+        // Verify TTL is set
+        let ttl = db.ttl("key1").unwrap();
+        assert!(ttl.is_some());
+        assert!(ttl.unwrap() > 0);
+
+        // Overwrite with regular SET (no expiry)
+        db.set("key1", b"value2").unwrap();
+
+        // TTL should be -1 (no expiry)
+        let ttl = db.ttl("key1").unwrap();
+        assert_eq!(ttl, Some(-1));
+
+        // Value should be updated
+        let value = db.get("key1").unwrap();
+        assert_eq!(value, Some(b"value2".to_vec()));
     }
 
     #[test]

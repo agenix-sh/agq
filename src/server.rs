@@ -201,6 +201,12 @@ async fn handle_command(
             }
             handle_exists(&args, db)
         }
+        "TTL" => {
+            if !*authenticated {
+                return Err(Error::NoAuth);
+            }
+            handle_ttl(&args, db)
+        }
         "LPUSH" => {
             if !*authenticated {
                 return Err(Error::NoAuth);
@@ -436,14 +442,25 @@ fn handle_get(args: &[RespValue], db: &Database) -> Result<RespValue> {
     }
 }
 
+/// Get current Unix timestamp in seconds
+///
+/// # Errors
+/// Returns an error if system time is before Unix epoch
+fn get_current_timestamp_secs() -> Result<u64> {
+    Ok(std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_err(|e| Error::Protocol(format!("System time error: {e}")))?
+        .as_secs())
+}
+
 /// Handle SET command
 ///
-/// Syntax: SET key value
+/// Syntax: SET key value [EX seconds] [PX milliseconds] [EXAT unix-time-seconds] [PXAT unix-time-milliseconds]
 /// Returns: OK
 fn handle_set(args: &[RespValue], db: &Database) -> Result<RespValue> {
-    if args.len() != 3 {
+    if args.len() < 3 {
         return Err(Error::InvalidArguments(
-            "SET requires exactly two arguments".to_string(),
+            "SET requires at least two arguments".to_string(),
         ));
     }
 
@@ -454,7 +471,127 @@ fn handle_set(args: &[RespValue], db: &Database) -> Result<RespValue> {
         ));
     };
 
-    db.set(&key, value)?;
+    // Maximum expiry duration: 10 years (prevents resource exhaustion)
+    const MAX_EXPIRY_SECONDS: u64 = 365 * 24 * 60 * 60 * 10;
+
+    // Parse optional expiry arguments
+    let mut expire_at: Option<u64> = None;
+    let mut i = 3;
+    while i < args.len() {
+        let option = args[i].as_string()?.to_uppercase();
+        match option.as_str() {
+            "EX" => {
+                // Seconds from now
+                if i + 1 >= args.len() {
+                    return Err(Error::InvalidArguments("EX requires a value".to_string()));
+                }
+                let seconds: u64 = args[i + 1].as_string()?.parse().map_err(|_| {
+                    Error::InvalidArguments("EX value must be an integer".to_string())
+                })?;
+
+                // Validate bounds to prevent overflow and resource exhaustion
+                if seconds > MAX_EXPIRY_SECONDS {
+                    return Err(Error::InvalidArguments(
+                        "Expiry time too far in future (max 10 years)".to_string(),
+                    ));
+                }
+
+                let now = get_current_timestamp_secs()?;
+
+                // Use checked arithmetic to prevent overflow
+                let expire_time = now
+                    .checked_add(seconds)
+                    .ok_or_else(|| Error::InvalidArguments("Expiry time overflow".to_string()))?;
+
+                expire_at = Some(expire_time);
+                i += 2;
+            }
+            "PX" => {
+                // Milliseconds from now
+                if i + 1 >= args.len() {
+                    return Err(Error::InvalidArguments("PX requires a value".to_string()));
+                }
+                let millis: u64 = args[i + 1].as_string()?.parse().map_err(|_| {
+                    Error::InvalidArguments("PX value must be an integer".to_string())
+                })?;
+
+                // Convert to seconds, rounding up (ceil division)
+                // This ensures PX 500 becomes 1 second, not 0
+                let seconds = millis.div_ceil(1000);
+                if seconds > MAX_EXPIRY_SECONDS {
+                    return Err(Error::InvalidArguments(
+                        "Expiry time too far in future (max 10 years)".to_string(),
+                    ));
+                }
+
+                let now = get_current_timestamp_secs()?;
+
+                // Use checked arithmetic to prevent overflow
+                let expire_time = now
+                    .checked_add(seconds)
+                    .ok_or_else(|| Error::InvalidArguments("Expiry time overflow".to_string()))?;
+
+                expire_at = Some(expire_time);
+                i += 2;
+            }
+            "EXAT" => {
+                // Absolute Unix timestamp in seconds
+                if i + 1 >= args.len() {
+                    return Err(Error::InvalidArguments("EXAT requires a value".to_string()));
+                }
+                let timestamp: u64 = args[i + 1].as_string()?.parse().map_err(|_| {
+                    Error::InvalidArguments("EXAT value must be an integer".to_string())
+                })?;
+
+                // Validate timestamp is reasonable (not more than 10 years in future)
+                let now = get_current_timestamp_secs()?;
+                if timestamp > now + MAX_EXPIRY_SECONDS {
+                    return Err(Error::InvalidArguments(
+                        "Expiry timestamp too far in future (max 10 years)".to_string(),
+                    ));
+                }
+
+                expire_at = Some(timestamp);
+                i += 2;
+            }
+            "PXAT" => {
+                // Absolute Unix timestamp in milliseconds
+                if i + 1 >= args.len() {
+                    return Err(Error::InvalidArguments("PXAT requires a value".to_string()));
+                }
+                let timestamp_millis: u64 = args[i + 1].as_string()?.parse().map_err(|_| {
+                    Error::InvalidArguments("PXAT value must be an integer".to_string())
+                })?;
+
+                // Convert to seconds, rounding up (ceil division)
+                // This ensures sub-second precision doesn't get lost
+                let timestamp = timestamp_millis.div_ceil(1000);
+                let now = get_current_timestamp_secs()?;
+                if timestamp > now + MAX_EXPIRY_SECONDS {
+                    return Err(Error::InvalidArguments(
+                        "Expiry timestamp too far in future (max 10 years)".to_string(),
+                    ));
+                }
+
+                expire_at = Some(timestamp);
+                i += 2;
+            }
+            _ => {
+                return Err(Error::InvalidArguments(format!(
+                    "Unknown SET option: {}",
+                    option
+                )));
+            }
+        }
+    }
+
+    // Set the key with or without expiry
+    if let Some(expire_time) = expire_at {
+        db.setex(&key, value, expire_time)?;
+    } else {
+        db.set(&key, value)?;
+    }
+
     Ok(RespValue::SimpleString("OK".to_string()))
 }
 
@@ -490,6 +627,25 @@ fn handle_exists(args: &[RespValue], db: &Database) -> Result<RespValue> {
     let exists = db.exists(&key)?;
 
     Ok(RespValue::Integer(i64::from(exists)))
+}
+
+/// Handle TTL command
+///
+/// Syntax: TTL key
+/// Returns: Integer - TTL in seconds, or -1 if no expiry, or -2 if key doesn't exist
+fn handle_ttl(args: &[RespValue], db: &Database) -> Result<RespValue> {
+    if args.len() != 2 {
+        return Err(Error::InvalidArguments(
+            "TTL requires exactly one argument".to_string(),
+        ));
+    }
+
+    let key = args[1].as_string()?;
+
+    match db.ttl(&key)? {
+        Some(ttl) => Ok(RespValue::Integer(ttl)),
+        None => Ok(RespValue::Integer(-2)), // Key doesn't exist
+    }
 }
 
 /// Handle LPUSH command

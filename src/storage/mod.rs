@@ -29,6 +29,29 @@ pub trait StringOps {
     /// Returns an error if the database operation fails.
     fn set(&self, key: &str, value: &[u8]) -> Result<()>;
 
+    /// Set a key-value pair with expiration time
+    ///
+    /// # Arguments
+    /// * `key` - The key to set
+    /// * `value` - The value to store
+    /// * `expire_at` - Unix timestamp (seconds) when the key should expire
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the database operation fails.
+    fn setex(&self, key: &str, value: &[u8], expire_at: u64) -> Result<()>;
+
+    /// Get the TTL (time to live) of a key in seconds
+    ///
+    /// # Returns
+    /// * `Some(seconds)` - Number of seconds until expiry
+    /// * `None` - Key doesn't exist or has no expiry
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the database operation fails.
+    fn ttl(&self, key: &str) -> Result<Option<i64>>;
+
     /// Delete a key
     ///
     /// # Errors
