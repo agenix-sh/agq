@@ -515,8 +515,9 @@ fn handle_set(args: &[RespValue], db: &Database) -> Result<RespValue> {
                     Error::InvalidArguments("PX value must be an integer".to_string())
                 })?;
 
-                // Convert to seconds for validation
-                let seconds = millis / 1000;
+                // Convert to seconds, rounding up (ceil division)
+                // This ensures PX 500 becomes 1 second, not 0
+                let seconds = millis.div_ceil(1000);
                 if seconds > MAX_EXPIRY_SECONDS {
                     return Err(Error::InvalidArguments(
                         "Expiry time too far in future (max 10 years)".to_string(),
@@ -562,8 +563,9 @@ fn handle_set(args: &[RespValue], db: &Database) -> Result<RespValue> {
                     Error::InvalidArguments("PXAT value must be an integer".to_string())
                 })?;
 
-                // Convert to seconds and validate
-                let timestamp = timestamp_millis / 1000;
+                // Convert to seconds, rounding up (ceil division)
+                // This ensures sub-second precision doesn't get lost
+                let timestamp = timestamp_millis.div_ceil(1000);
                 let now = get_current_timestamp_secs()?;
                 if timestamp > now + MAX_EXPIRY_SECONDS {
                     return Err(Error::InvalidArguments(

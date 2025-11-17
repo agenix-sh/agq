@@ -247,17 +247,48 @@ impl StringOps for Database {
             .begin_read()
             .map_err(|e| Error::Protocol(format!("Failed to begin read transaction: {e}")))?;
 
-        let table = read_txn
+        let kv_table = read_txn
             .open_table(KV_TABLE)
             .map_err(|e| Error::Protocol(format!("Failed to open KV table: {e}")))?;
+        let expiry_table = read_txn
+            .open_table(EXPIRY_TABLE)
+            .map_err(|e| Error::Protocol(format!("Failed to open expiry table: {e}")))?;
 
-        let exists = table
+        // Check if key exists in KV table
+        let key_exists = kv_table
             .get(key)
             .map_err(|e| Error::Protocol(format!("Failed to check key: {e}")))?
             .is_some();
 
-        debug!("EXISTS {} -> {}", key, exists);
-        Ok(exists)
+        if !key_exists {
+            debug!("EXISTS {} -> false (not found)", key);
+            return Ok(false);
+        }
+
+        // Check if key has expired
+        if let Ok(Some(expire_bytes)) = expiry_table.get(key) {
+            if expire_bytes.value().len() == 8 {
+                let expire_at = u64::from_le_bytes(
+                    expire_bytes
+                        .value()
+                        .try_into()
+                        .map_err(|_| Error::Protocol("Invalid expiry format".to_string()))?,
+                );
+                let now = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map_err(|e| Error::Protocol(format!("System time error: {e}")))?
+                    .as_secs();
+
+                if expire_at <= now {
+                    // Key has expired, return false (lazy expiration check)
+                    debug!("EXISTS {} -> false (expired)", key);
+                    return Ok(false);
+                }
+            }
+        }
+
+        debug!("EXISTS {} -> true", key);
+        Ok(true)
     }
 
     fn setex(&self, key: &str, value: &[u8], expire_at: u64) -> Result<()> {
@@ -350,7 +381,7 @@ impl StringOps for Database {
                     drop(kv_table);
                     drop(read_txn);
 
-                    // Clean up expired key
+                    // Clean up expired key (idempotent - safe if key already deleted)
                     let write_txn = self.db.begin_write().map_err(|e| {
                         Error::Protocol(format!("Failed to begin write transaction: {e}"))
                     })?;
@@ -362,12 +393,9 @@ impl StringOps for Database {
                             Error::Protocol(format!("Failed to open expiry table: {e}"))
                         })?;
 
-                        kv_table.remove(key).map_err(|e| {
-                            Error::Protocol(format!("Failed to remove expired key: {e}"))
-                        })?;
-                        expiry_table.remove(key).map_err(|e| {
-                            Error::Protocol(format!("Failed to remove expiry entry: {e}"))
-                        })?;
+                        // Idempotent removes - ignore if key doesn't exist
+                        let _ = kv_table.remove(key);
+                        let _ = expiry_table.remove(key);
                     }
                     write_txn
                         .commit()

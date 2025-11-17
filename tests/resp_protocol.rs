@@ -1782,3 +1782,69 @@ async fn test_ttl_cleanup_expired_key() {
     let response = send_resp_command(&mut stream, get_cmd).await;
     assert_eq!(&response, b"$-1\r\n", "GET should return nil after cleanup");
 }
+
+#[tokio::test]
+async fn test_px_sub_second_precision() {
+    let (_handle, port) = start_test_server().await;
+    let mut stream = TcpStream::connect(format!("127.0.0.1:{port}"))
+        .await
+        .expect("Failed to connect");
+
+    // Authenticate
+    let auth_cmd = b"*2\r\n$4\r\nAUTH\r\n$32\r\ntest_session_key_32_bytes_long!!\r\n";
+    send_resp_command(&mut stream, auth_cmd).await;
+
+    // SET key with PX 500 (500 milliseconds)
+    // Should round up to 1 second, not become 0
+    let set_cmd = b"*5\r\n$3\r\nSET\r\n$7\r\ntestkey\r\n$5\r\nvalue\r\n$2\r\nPX\r\n$3\r\n500\r\n";
+    let response = send_resp_command(&mut stream, set_cmd).await;
+    assert_eq!(&response, b"+OK\r\n", "SET with PX 500 should succeed");
+
+    // TTL should return 1, not 0 or -1
+    let ttl_cmd = b"*2\r\n$3\r\nTTL\r\n$7\r\ntestkey\r\n";
+    let response = send_resp_command(&mut stream, ttl_cmd).await;
+    let ttl_str = std::str::from_utf8(&response[1..response.len() - 2]).unwrap();
+    let ttl: i64 = ttl_str.parse().unwrap();
+    assert!(
+        ttl >= 1,
+        "PX 500 should round up to at least 1 second, got {}",
+        ttl
+    );
+
+    // Key should still exist
+    let get_cmd = b"*2\r\n$3\r\nGET\r\n$7\r\ntestkey\r\n";
+    let response = send_resp_command(&mut stream, get_cmd).await;
+    assert_eq!(&response, b"$5\r\nvalue\r\n", "Key should exist");
+}
+
+#[tokio::test]
+async fn test_exists_expired_key() {
+    let (_handle, port) = start_test_server().await;
+    let mut stream = TcpStream::connect(format!("127.0.0.1:{port}"))
+        .await
+        .expect("Failed to connect");
+
+    // Authenticate
+    let auth_cmd = b"*2\r\n$4\r\nAUTH\r\n$32\r\ntest_session_key_32_bytes_long!!\r\n";
+    send_resp_command(&mut stream, auth_cmd).await;
+
+    // SET key with EX 1
+    let set_cmd = b"*5\r\n$3\r\nSET\r\n$7\r\ntestkey\r\n$5\r\nvalue\r\n$2\r\nEX\r\n$1\r\n1\r\n";
+    send_resp_command(&mut stream, set_cmd).await;
+
+    // EXISTS should return 1 (true)
+    let exists_cmd = b"*2\r\n$6\r\nEXISTS\r\n$7\r\ntestkey\r\n";
+    let response = send_resp_command(&mut stream, exists_cmd).await;
+    assert_eq!(&response, b":1\r\n", "EXISTS should return 1 before expiry");
+
+    // Wait for expiry
+    tokio::time::sleep(tokio::time::Duration::from_secs(2)).await;
+
+    // EXISTS should return 0 (false) for expired key
+    let exists_cmd = b"*2\r\n$6\r\nEXISTS\r\n$7\r\ntestkey\r\n";
+    let response = send_resp_command(&mut stream, exists_cmd).await;
+    assert_eq!(
+        &response, b":0\r\n",
+        "EXISTS should return 0 for expired key"
+    );
+}
