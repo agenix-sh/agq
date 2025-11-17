@@ -2,7 +2,7 @@
 
 use crate::error::{Error, Result};
 use crate::resp::{RespParser, RespValue};
-use crate::storage::{Database, ListOps, StringOps};
+use crate::storage::{Database, ListOps, SortedSetOps, StringOps};
 use std::sync::Arc;
 use subtle::ConstantTimeEq;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -231,6 +231,42 @@ async fn handle_command(
             }
             handle_lrange(&args, db)
         }
+        "ZADD" => {
+            if !*authenticated {
+                return Err(Error::NoAuth);
+            }
+            handle_zadd(&args, db)
+        }
+        "ZRANGE" => {
+            if !*authenticated {
+                return Err(Error::NoAuth);
+            }
+            handle_zrange(&args, db)
+        }
+        "ZRANGEBYSCORE" => {
+            if !*authenticated {
+                return Err(Error::NoAuth);
+            }
+            handle_zrangebyscore(&args, db)
+        }
+        "ZREM" => {
+            if !*authenticated {
+                return Err(Error::NoAuth);
+            }
+            handle_zrem(&args, db)
+        }
+        "ZSCORE" => {
+            if !*authenticated {
+                return Err(Error::NoAuth);
+            }
+            handle_zscore(&args, db)
+        }
+        "ZCARD" => {
+            if !*authenticated {
+                return Err(Error::NoAuth);
+            }
+            handle_zcard(&args, db)
+        }
         _ => {
             if !*authenticated {
                 return Err(Error::NoAuth);
@@ -272,18 +308,17 @@ fn handle_auth(
 
     // Support both raw bytes and hex-encoded strings for compatibility
     // If the key looks like hex (64 chars, all hex digits), try to decode it
-    let key_to_compare = if provided_key.len() == 64
-        && provided_key.iter().all(|&b| b.is_ascii_hexdigit())
-    {
-        // Try to decode hex string
-        match hex::decode(provided_key) {
-            Ok(decoded) => decoded,
-            Err(_) => provided_key.clone(), // Fall back to raw bytes if decode fails
-        }
-    } else {
-        // Use raw bytes as-is
-        provided_key.clone()
-    };
+    let key_to_compare =
+        if provided_key.len() == 64 && provided_key.iter().all(|&b| b.is_ascii_hexdigit()) {
+            // Try to decode hex string
+            match hex::decode(provided_key) {
+                Ok(decoded) => decoded,
+                Err(_) => provided_key.clone(), // Fall back to raw bytes if decode fails
+            }
+        } else {
+            // Use raw bytes as-is
+            provided_key.clone()
+        };
 
     // Security: Constant-time comparison to prevent timing attacks
     // Pad to same length for constant-time comparison
@@ -518,6 +553,175 @@ fn handle_lrange(args: &[RespValue], db: &Database) -> Result<RespValue> {
     Ok(RespValue::Array(resp_elements))
 }
 
+/// Handle ZADD command
+///
+/// Syntax: ZADD key score member
+/// Returns: Integer - 1 if new member added, 0 if member updated
+///
+/// # Security
+/// - Validates score is a finite number
+/// - Rejects NaN, Infinity, -Infinity
+fn handle_zadd(args: &[RespValue], db: &Database) -> Result<RespValue> {
+    if args.len() != 4 {
+        return Err(Error::InvalidArguments(
+            "ZADD requires exactly three arguments (key score member)".to_string(),
+        ));
+    }
+
+    let key = args[1].as_string()?;
+    let score_str = args[2].as_string()?;
+    let RespValue::BulkString(member) = &args[3] else {
+        return Err(Error::InvalidArguments(
+            "ZADD member must be a bulk string".to_string(),
+        ));
+    };
+
+    // Security: Parse and validate score
+    let score: f64 = score_str
+        .parse()
+        .map_err(|_| Error::InvalidArguments("ZADD score must be a valid number".to_string()))?;
+
+    // Security check is done in db.zadd() which rejects non-finite scores
+    let added = db.zadd(&key, score, member)?;
+    Ok(RespValue::Integer(added as i64))
+}
+
+/// Handle ZRANGE command
+///
+/// Syntax: ZRANGE key start stop
+/// Returns: Array of (member, score) pairs
+fn handle_zrange(args: &[RespValue], db: &Database) -> Result<RespValue> {
+    if args.len() != 4 {
+        return Err(Error::InvalidArguments(
+            "ZRANGE requires exactly three arguments (key start stop)".to_string(),
+        ));
+    }
+
+    let key = args[1].as_string()?;
+    let start_str = args[2].as_string()?;
+    let stop_str = args[3].as_string()?;
+
+    let start: i64 = start_str
+        .parse()
+        .map_err(|_| Error::InvalidArguments("ZRANGE start must be an integer".to_string()))?;
+    let stop: i64 = stop_str
+        .parse()
+        .map_err(|_| Error::InvalidArguments("ZRANGE stop must be an integer".to_string()))?;
+
+    let members = db.zrange(&key, start, stop)?;
+
+    // Return array of alternating member/score pairs (Redis format)
+    let mut resp_elements = Vec::with_capacity(members.len() * 2);
+    for (member, score) in members {
+        resp_elements.push(RespValue::BulkString(member));
+        resp_elements.push(RespValue::BulkString(score.to_string().into_bytes()));
+    }
+
+    Ok(RespValue::Array(resp_elements))
+}
+
+/// Handle ZRANGEBYSCORE command
+///
+/// Syntax: ZRANGEBYSCORE key min max
+/// Returns: Array of (member, score) pairs
+///
+/// # Security
+/// - Validates min/max are finite numbers
+fn handle_zrangebyscore(args: &[RespValue], db: &Database) -> Result<RespValue> {
+    if args.len() != 4 {
+        return Err(Error::InvalidArguments(
+            "ZRANGEBYSCORE requires exactly three arguments (key min max)".to_string(),
+        ));
+    }
+
+    let key = args[1].as_string()?;
+    let min_str = args[2].as_string()?;
+    let max_str = args[3].as_string()?;
+
+    // Security: Parse and validate scores
+    let min_score: f64 = min_str.parse().map_err(|_| {
+        Error::InvalidArguments("ZRANGEBYSCORE min must be a valid number".to_string())
+    })?;
+
+    let max_score: f64 = max_str.parse().map_err(|_| {
+        Error::InvalidArguments("ZRANGEBYSCORE max must be a valid number".to_string())
+    })?;
+
+    // Security check is done in db.zrangebyscore() which rejects non-finite scores
+    let members = db.zrangebyscore(&key, min_score, max_score)?;
+
+    // Return array of alternating member/score pairs (Redis format)
+    let mut resp_elements = Vec::with_capacity(members.len() * 2);
+    for (member, score) in members {
+        resp_elements.push(RespValue::BulkString(member));
+        resp_elements.push(RespValue::BulkString(score.to_string().into_bytes()));
+    }
+
+    Ok(RespValue::Array(resp_elements))
+}
+
+/// Handle ZREM command
+///
+/// Syntax: ZREM key member
+/// Returns: Integer - 1 if removed, 0 if member didn't exist
+fn handle_zrem(args: &[RespValue], db: &Database) -> Result<RespValue> {
+    if args.len() != 3 {
+        return Err(Error::InvalidArguments(
+            "ZREM requires exactly two arguments (key member)".to_string(),
+        ));
+    }
+
+    let key = args[1].as_string()?;
+    let RespValue::BulkString(member) = &args[2] else {
+        return Err(Error::InvalidArguments(
+            "ZREM member must be a bulk string".to_string(),
+        ));
+    };
+
+    let removed = db.zrem(&key, member)?;
+    Ok(RespValue::Integer(removed as i64))
+}
+
+/// Handle ZSCORE command
+///
+/// Syntax: ZSCORE key member
+/// Returns: Bulk string score or nil if member doesn't exist
+fn handle_zscore(args: &[RespValue], db: &Database) -> Result<RespValue> {
+    if args.len() != 3 {
+        return Err(Error::InvalidArguments(
+            "ZSCORE requires exactly two arguments (key member)".to_string(),
+        ));
+    }
+
+    let key = args[1].as_string()?;
+    let RespValue::BulkString(member) = &args[2] else {
+        return Err(Error::InvalidArguments(
+            "ZSCORE member must be a bulk string".to_string(),
+        ));
+    };
+
+    match db.zscore(&key, member)? {
+        Some(score) => Ok(RespValue::BulkString(score.to_string().into_bytes())),
+        None => Ok(RespValue::NullBulkString),
+    }
+}
+
+/// Handle ZCARD command
+///
+/// Syntax: ZCARD key
+/// Returns: Integer - number of members in sorted set
+fn handle_zcard(args: &[RespValue], db: &Database) -> Result<RespValue> {
+    if args.len() != 2 {
+        return Err(Error::InvalidArguments(
+            "ZCARD requires exactly one argument (key)".to_string(),
+        ));
+    }
+
+    let key = args[1].as_string()?;
+    let count = db.zcard(&key)?;
+    Ok(RespValue::Integer(count as i64))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -595,8 +799,9 @@ mod tests {
     async fn test_auth_handler_hex_encoded() {
         let mut authenticated = false;
         // 32-byte key
-        let session_key = hex::decode("4f90ccd2c864cee924523ec901c450f543753103b3c0da793561b1f9e3eaf579")
-            .unwrap();
+        let session_key =
+            hex::decode("4f90ccd2c864cee924523ec901c450f543753103b3c0da793561b1f9e3eaf579")
+                .unwrap();
 
         // Client sends hex-encoded string (64 chars)
         let args = vec![

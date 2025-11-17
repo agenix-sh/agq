@@ -1,6 +1,6 @@
 //! Database wrapper for redb embedded storage
 
-use crate::storage::{ListOps, StringOps};
+use crate::storage::{ListOps, SortedSetOps, StringOps};
 use crate::{Error, Result};
 use async_trait::async_trait;
 use redb::{Database as RedbDatabase, ReadableTable, TableDefinition};
@@ -21,6 +21,15 @@ const LIST_META_TABLE: TableDefinition<&str, &[u8]> = TableDefinition::new("list
 /// Table for list elements
 /// Key: "{list_name}:{index}", Value: element bytes
 const LIST_DATA_TABLE: TableDefinition<&str, &[u8]> = TableDefinition::new("list_data");
+
+/// Table for sorted set member-to-score mapping
+/// Key: "{zset_name}:{member}", Value: score (8 bytes, f64)
+const ZSET_MEMBER_TABLE: TableDefinition<&str, &[u8]> = TableDefinition::new("zset_member");
+
+/// Table for sorted set score-to-member mapping (for range queries)
+/// Key: "{zset_name}:{score_bytes}:{member}", Value: empty
+/// The score is encoded as a sortable byte representation
+const ZSET_SCORE_TABLE: TableDefinition<&str, &[u8]> = TableDefinition::new("zset_score");
 
 /// AGQ Database wrapper
 ///
@@ -74,6 +83,12 @@ impl Database {
             let _list_data_table = write_txn
                 .open_table(LIST_DATA_TABLE)
                 .map_err(|e| Error::Protocol(format!("Failed to open list data table: {e}")))?;
+            let _zset_member_table = write_txn
+                .open_table(ZSET_MEMBER_TABLE)
+                .map_err(|e| Error::Protocol(format!("Failed to open zset member table: {e}")))?;
+            let _zset_score_table = write_txn
+                .open_table(ZSET_SCORE_TABLE)
+                .map_err(|e| Error::Protocol(format!("Failed to open zset score table: {e}")))?;
         }
         write_txn
             .commit()
@@ -201,6 +216,84 @@ fn decode_list_meta(bytes: &[u8]) -> Result<(i64, i64)> {
 
 fn list_element_key(list_key: &str, index: i64) -> String {
     format!("{}:{}", list_key, index)
+}
+
+/// Helper functions for sorted set operations
+/// Encode f64 score to sortable bytes
+/// Uses IEEE 754 with sign bit manipulation for proper sorting
+fn encode_score(score: f64) -> [u8; 8] {
+    let bits = score.to_bits();
+    // Flip sign bit for negative numbers, or all bits if negative
+    let sortable_bits = if (bits & (1u64 << 63)) != 0 {
+        // Negative: flip all bits
+        !bits
+    } else {
+        // Positive: flip only sign bit
+        bits ^ (1u64 << 63)
+    };
+    sortable_bits.to_be_bytes()
+}
+
+/// Decode sortable bytes back to f64 score
+fn decode_score(bytes: &[u8]) -> Result<f64> {
+    if bytes.len() != 8 {
+        return Err(Error::Protocol("Invalid score bytes".to_string()));
+    }
+    let sortable_bits = u64::from_be_bytes(bytes.try_into().unwrap());
+    // Reverse the sign bit manipulation
+    let bits = if (sortable_bits & (1u64 << 63)) == 0 {
+        // Was negative: flip all bits back
+        !sortable_bits
+    } else {
+        // Was positive: flip only sign bit back
+        sortable_bits ^ (1u64 << 63)
+    };
+    Ok(f64::from_bits(bits))
+}
+
+/// Create member key for ZSET_MEMBER_TABLE: "{zset}:{member}"
+fn zset_member_key(zset: &str, member: &[u8]) -> Vec<u8> {
+    let mut key = Vec::with_capacity(zset.len() + 1 + member.len());
+    key.extend_from_slice(zset.as_bytes());
+    key.push(b':');
+    key.extend_from_slice(member);
+    key
+}
+
+/// Create score key for ZSET_SCORE_TABLE: "{zset}:{score_hex}:{member_hex}"
+/// We use hex encoding to ensure the key is valid UTF-8 for redb's &str keys
+fn zset_score_key(zset: &str, score: f64, member: &[u8]) -> String {
+    let score_bytes = encode_score(score);
+    let score_hex = hex::encode(score_bytes);
+    let member_hex = hex::encode(member);
+    format!("{}:{}:{}", zset, score_hex, member_hex)
+}
+
+/// Parse member from score key: "{zset}:{score_hex}:{member_hex}" -> (member, score)
+fn parse_score_key(key_str: &str, zset_prefix_len: usize) -> Result<(Vec<u8>, f64)> {
+    // Format: "{zset}:{score_hex}:{member_hex}"
+    // Skip "{zset}:" part
+    let after_zset = &key_str[zset_prefix_len + 1..];
+
+    // Find the second colon
+    let parts: Vec<&str> = after_zset.splitn(2, ':').collect();
+    if parts.len() != 2 {
+        return Err(Error::Protocol("Invalid score key format".to_string()));
+    }
+
+    // Decode score from hex
+    let score_bytes = hex::decode(parts[0])
+        .map_err(|_| Error::Protocol("Invalid score hex encoding".to_string()))?;
+    if score_bytes.len() != 8 {
+        return Err(Error::Protocol("Invalid score bytes length".to_string()));
+    }
+    let score = decode_score(&score_bytes)?;
+
+    // Decode member from hex
+    let member = hex::decode(parts[1])
+        .map_err(|_| Error::Protocol("Invalid member hex encoding".to_string()))?;
+
+    Ok((member, score))
 }
 
 #[async_trait]
@@ -472,6 +565,290 @@ impl ListOps for Database {
     }
 }
 
+impl SortedSetOps for Database {
+    fn zadd(&self, key: &str, score: f64, member: &[u8]) -> Result<u64> {
+        // Security: Validate score is not NaN or infinite
+        if !score.is_finite() {
+            return Err(Error::InvalidArguments(
+                "Score must be a finite number".to_string(),
+            ));
+        }
+
+        let write_txn = self
+            .db
+            .begin_write()
+            .map_err(|e| Error::Protocol(format!("Failed to begin write transaction: {e}")))?;
+
+        let added = {
+            let mut member_table = write_txn
+                .open_table(ZSET_MEMBER_TABLE)
+                .map_err(|e| Error::Protocol(format!("Failed to open zset member table: {e}")))?;
+            let mut score_table = write_txn
+                .open_table(ZSET_SCORE_TABLE)
+                .map_err(|e| Error::Protocol(format!("Failed to open zset score table: {e}")))?;
+
+            let member_key = zset_member_key(key, member);
+            let member_key_str = String::from_utf8_lossy(&member_key);
+
+            // Check if member already exists
+            let is_new =
+                if let Ok(Some(old_score_bytes)) = member_table.get(member_key_str.as_ref()) {
+                    // Member exists, remove old score index entry
+                    let old_score = decode_score(old_score_bytes.value())?;
+                    let old_score_key = zset_score_key(key, old_score, member);
+                    score_table.remove(old_score_key.as_str()).map_err(|e| {
+                        Error::Protocol(format!("Failed to remove old score entry: {e}"))
+                    })?;
+                    false // Not a new member
+                } else {
+                    true // New member
+                };
+
+            // Add/update member-to-score mapping
+            let score_bytes = encode_score(score);
+            member_table
+                .insert(member_key_str.as_ref(), &score_bytes[..])
+                .map_err(|e| Error::Protocol(format!("Failed to insert member: {e}")))?;
+
+            // Add score-to-member index entry
+            let score_key = zset_score_key(key, score, member);
+            score_table
+                .insert(score_key.as_str(), &b""[..])
+                .map_err(|e| Error::Protocol(format!("Failed to insert score index: {e}")))?;
+
+            u64::from(is_new)
+        };
+
+        write_txn
+            .commit()
+            .map_err(|e| Error::Protocol(format!("Failed to commit transaction: {e}")))?;
+
+        debug!("ZADD {} {} -> added: {}", key, score, added);
+        Ok(added)
+    }
+
+    fn zrange(&self, key: &str, start: i64, stop: i64) -> Result<Vec<(Vec<u8>, f64)>> {
+        let read_txn = self
+            .db
+            .begin_read()
+            .map_err(|e| Error::Protocol(format!("Failed to begin read transaction: {e}")))?;
+
+        let score_table = read_txn
+            .open_table(ZSET_SCORE_TABLE)
+            .map_err(|e| Error::Protocol(format!("Failed to open zset score table: {e}")))?;
+
+        // Collect all members for this sorted set
+        let prefix = format!("{}:", key);
+        let mut members: Vec<(Vec<u8>, f64)> = Vec::new();
+
+        // Iterate through score table (already sorted by score)
+        for item in score_table
+            .iter()
+            .map_err(|e| Error::Protocol(format!("Failed to iterate score table: {e}")))?
+        {
+            let (k, _) =
+                item.map_err(|e| Error::Protocol(format!("Failed to read score entry: {e}")))?;
+            let key_str = k.value();
+
+            if key_str.starts_with(&prefix) {
+                let (member, score) = parse_score_key(key_str, prefix.len() - 1)?;
+                members.push((member, score));
+            }
+        }
+
+        if members.is_empty() {
+            return Ok(vec![]);
+        }
+
+        let len = members.len() as i64;
+
+        // Convert negative indices to positive
+        let start_idx = if start < 0 {
+            (len + start).max(0) as usize
+        } else {
+            (start.min(len - 1)) as usize
+        };
+
+        let stop_idx = if stop < 0 {
+            (len + stop).max(-1) as usize
+        } else {
+            (stop.min(len - 1)) as usize
+        };
+
+        if start_idx > stop_idx {
+            return Ok(vec![]);
+        }
+
+        let result = members[start_idx..=stop_idx].to_vec();
+        debug!(
+            "ZRANGE {} {} {} -> {} members",
+            key,
+            start,
+            stop,
+            result.len()
+        );
+        Ok(result)
+    }
+
+    fn zrangebyscore(
+        &self,
+        key: &str,
+        min_score: f64,
+        max_score: f64,
+    ) -> Result<Vec<(Vec<u8>, f64)>> {
+        // Security: Validate scores are finite
+        if !min_score.is_finite() || !max_score.is_finite() {
+            return Err(Error::InvalidArguments(
+                "Scores must be finite numbers".to_string(),
+            ));
+        }
+
+        let read_txn = self
+            .db
+            .begin_read()
+            .map_err(|e| Error::Protocol(format!("Failed to begin read transaction: {e}")))?;
+
+        let score_table = read_txn
+            .open_table(ZSET_SCORE_TABLE)
+            .map_err(|e| Error::Protocol(format!("Failed to open zset score table: {e}")))?;
+
+        let prefix = format!("{}:", key);
+        let mut members: Vec<(Vec<u8>, f64)> = Vec::new();
+
+        // Iterate through score table and filter by score range
+        for item in score_table
+            .iter()
+            .map_err(|e| Error::Protocol(format!("Failed to iterate score table: {e}")))?
+        {
+            let (k, _) =
+                item.map_err(|e| Error::Protocol(format!("Failed to read score entry: {e}")))?;
+            let key_str = k.value();
+
+            if key_str.starts_with(&prefix) {
+                let (member, score) = parse_score_key(key_str, prefix.len() - 1)?;
+                if score >= min_score && score <= max_score {
+                    members.push((member, score));
+                }
+            }
+        }
+
+        debug!(
+            "ZRANGEBYSCORE {} {} {} -> {} members",
+            key,
+            min_score,
+            max_score,
+            members.len()
+        );
+        Ok(members)
+    }
+
+    fn zrem(&self, key: &str, member: &[u8]) -> Result<u64> {
+        let write_txn = self
+            .db
+            .begin_write()
+            .map_err(|e| Error::Protocol(format!("Failed to begin write transaction: {e}")))?;
+
+        let removed = {
+            let mut member_table = write_txn
+                .open_table(ZSET_MEMBER_TABLE)
+                .map_err(|e| Error::Protocol(format!("Failed to open zset member table: {e}")))?;
+            let mut score_table = write_txn
+                .open_table(ZSET_SCORE_TABLE)
+                .map_err(|e| Error::Protocol(format!("Failed to open zset score table: {e}")))?;
+
+            let member_key = zset_member_key(key, member);
+            let member_key_str = String::from_utf8_lossy(&member_key);
+
+            // Get the score first
+            let score_bytes = match member_table.get(member_key_str.as_ref()) {
+                Ok(Some(bytes)) => bytes.value().to_vec(),
+                Ok(None) => return Ok(0), // Member doesn't exist
+                Err(e) => return Err(Error::Protocol(format!("Failed to get member: {e}"))),
+            };
+
+            let score = decode_score(&score_bytes)?;
+
+            // Remove member-to-score mapping
+            member_table
+                .remove(member_key_str.as_ref())
+                .map_err(|e| Error::Protocol(format!("Failed to remove member: {e}")))?;
+
+            // Remove score-to-member index
+            let score_key = zset_score_key(key, score, member);
+            score_table
+                .remove(score_key.as_str())
+                .map_err(|e| Error::Protocol(format!("Failed to remove score index: {e}")))?;
+
+            1u64
+        };
+
+        write_txn
+            .commit()
+            .map_err(|e| Error::Protocol(format!("Failed to commit transaction: {e}")))?;
+
+        debug!("ZREM {} -> removed: {}", key, removed);
+        Ok(removed)
+    }
+
+    fn zscore(&self, key: &str, member: &[u8]) -> Result<Option<f64>> {
+        let read_txn = self
+            .db
+            .begin_read()
+            .map_err(|e| Error::Protocol(format!("Failed to begin read transaction: {e}")))?;
+
+        let member_table = read_txn
+            .open_table(ZSET_MEMBER_TABLE)
+            .map_err(|e| Error::Protocol(format!("Failed to open zset member table: {e}")))?;
+
+        let member_key = zset_member_key(key, member);
+        let member_key_str = String::from_utf8_lossy(&member_key);
+
+        match member_table.get(member_key_str.as_ref()) {
+            Ok(Some(score_bytes)) => {
+                let score = decode_score(score_bytes.value())?;
+                debug!("ZSCORE {} -> {}", key, score);
+                Ok(Some(score))
+            }
+            Ok(None) => {
+                debug!("ZSCORE {} -> (nil)", key);
+                Ok(None)
+            }
+            Err(e) => Err(Error::Protocol(format!("Failed to get score: {e}"))),
+        }
+    }
+
+    fn zcard(&self, key: &str) -> Result<u64> {
+        let read_txn = self
+            .db
+            .begin_read()
+            .map_err(|e| Error::Protocol(format!("Failed to begin read transaction: {e}")))?;
+
+        let score_table = read_txn
+            .open_table(ZSET_SCORE_TABLE)
+            .map_err(|e| Error::Protocol(format!("Failed to open zset score table: {e}")))?;
+
+        let prefix = format!("{}:", key);
+        let mut count = 0u64;
+
+        for item in score_table
+            .iter()
+            .map_err(|e| Error::Protocol(format!("Failed to iterate score table: {e}")))?
+        {
+            let (k, _) =
+                item.map_err(|e| Error::Protocol(format!("Failed to read score entry: {e}")))?;
+            let key_str = k.value();
+            if key_str.starts_with(&prefix) {
+                count = count
+                    .checked_add(1)
+                    .ok_or_else(|| Error::Protocol("Count overflow".to_string()))?;
+            }
+        }
+
+        debug!("ZCARD {} -> {}", key, count);
+        Ok(count)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -724,5 +1101,286 @@ mod tests {
         assert_eq!(value, Some(b"delayed".to_vec()));
         // Should complete in ~500ms, not 5 seconds
         assert!(elapsed < std::time::Duration::from_secs(1));
+    }
+
+    // Sorted Set Tests
+
+    #[test]
+    fn test_zadd_and_zscore() {
+        let (db, _temp) = test_db();
+
+        // Add first member
+        let added = db.zadd("myzset", 1.5, b"member1").unwrap();
+        assert_eq!(added, 1); // New member
+
+        // Add second member
+        let added = db.zadd("myzset", 2.5, b"member2").unwrap();
+        assert_eq!(added, 1);
+
+        // Update existing member (should return 0)
+        let added = db.zadd("myzset", 3.0, b"member1").unwrap();
+        assert_eq!(added, 0); // Not new
+
+        // Check scores
+        assert_eq!(db.zscore("myzset", b"member1").unwrap(), Some(3.0));
+        assert_eq!(db.zscore("myzset", b"member2").unwrap(), Some(2.5));
+        assert_eq!(db.zscore("myzset", b"nonexistent").unwrap(), None);
+    }
+
+    #[test]
+    fn test_zadd_negative_scores() {
+        let (db, _temp) = test_db();
+
+        db.zadd("myzset", -10.5, b"negative").unwrap();
+        db.zadd("myzset", 0.0, b"zero").unwrap();
+        db.zadd("myzset", 10.5, b"positive").unwrap();
+
+        assert_eq!(db.zscore("myzset", b"negative").unwrap(), Some(-10.5));
+        assert_eq!(db.zscore("myzset", b"zero").unwrap(), Some(0.0));
+        assert_eq!(db.zscore("myzset", b"positive").unwrap(), Some(10.5));
+    }
+
+    #[test]
+    fn test_zadd_nan_rejected() {
+        let (db, _temp) = test_db();
+
+        let result = db.zadd("myzset", f64::NAN, b"member");
+        assert!(result.is_err());
+
+        let result = db.zadd("myzset", f64::INFINITY, b"member");
+        assert!(result.is_err());
+
+        let result = db.zadd("myzset", f64::NEG_INFINITY, b"member");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_zrange_all() {
+        let (db, _temp) = test_db();
+
+        db.zadd("myzset", 1.0, b"one").unwrap();
+        db.zadd("myzset", 2.0, b"two").unwrap();
+        db.zadd("myzset", 3.0, b"three").unwrap();
+
+        let members = db.zrange("myzset", 0, -1).unwrap();
+        assert_eq!(members.len(), 3);
+        assert_eq!(members[0], (b"one".to_vec(), 1.0));
+        assert_eq!(members[1], (b"two".to_vec(), 2.0));
+        assert_eq!(members[2], (b"three".to_vec(), 3.0));
+    }
+
+    #[test]
+    fn test_zrange_partial() {
+        let (db, _temp) = test_db();
+
+        db.zadd("myzset", 1.0, b"one").unwrap();
+        db.zadd("myzset", 2.0, b"two").unwrap();
+        db.zadd("myzset", 3.0, b"three").unwrap();
+        db.zadd("myzset", 4.0, b"four").unwrap();
+
+        // Get first two
+        let members = db.zrange("myzset", 0, 1).unwrap();
+        assert_eq!(members.len(), 2);
+        assert_eq!(members[0], (b"one".to_vec(), 1.0));
+        assert_eq!(members[1], (b"two".to_vec(), 2.0));
+
+        // Get last two
+        let members = db.zrange("myzset", -2, -1).unwrap();
+        assert_eq!(members.len(), 2);
+        assert_eq!(members[0], (b"three".to_vec(), 3.0));
+        assert_eq!(members[1], (b"four".to_vec(), 4.0));
+    }
+
+    #[test]
+    fn test_zrange_empty() {
+        let (db, _temp) = test_db();
+
+        let members = db.zrange("nonexistent", 0, -1).unwrap();
+        assert_eq!(members.len(), 0);
+    }
+
+    #[test]
+    fn test_zrange_with_negative_scores() {
+        let (db, _temp) = test_db();
+
+        db.zadd("myzset", -2.0, b"minus_two").unwrap();
+        db.zadd("myzset", -1.0, b"minus_one").unwrap();
+        db.zadd("myzset", 0.0, b"zero").unwrap();
+        db.zadd("myzset", 1.0, b"one").unwrap();
+
+        let members = db.zrange("myzset", 0, -1).unwrap();
+        assert_eq!(members.len(), 4);
+        // Should be sorted by score
+        assert_eq!(members[0], (b"minus_two".to_vec(), -2.0));
+        assert_eq!(members[1], (b"minus_one".to_vec(), -1.0));
+        assert_eq!(members[2], (b"zero".to_vec(), 0.0));
+        assert_eq!(members[3], (b"one".to_vec(), 1.0));
+    }
+
+    #[test]
+    fn test_zrangebyscore() {
+        let (db, _temp) = test_db();
+
+        db.zadd("myzset", 1.0, b"one").unwrap();
+        db.zadd("myzset", 2.0, b"two").unwrap();
+        db.zadd("myzset", 3.0, b"three").unwrap();
+        db.zadd("myzset", 4.0, b"four").unwrap();
+        db.zadd("myzset", 5.0, b"five").unwrap();
+
+        // Get range [2.0, 4.0]
+        let members = db.zrangebyscore("myzset", 2.0, 4.0).unwrap();
+        assert_eq!(members.len(), 3);
+        assert_eq!(members[0], (b"two".to_vec(), 2.0));
+        assert_eq!(members[1], (b"three".to_vec(), 3.0));
+        assert_eq!(members[2], (b"four".to_vec(), 4.0));
+    }
+
+    #[test]
+    fn test_zrangebyscore_empty_range() {
+        let (db, _temp) = test_db();
+
+        db.zadd("myzset", 1.0, b"one").unwrap();
+        db.zadd("myzset", 5.0, b"five").unwrap();
+
+        // No members in range [2.0, 4.0]
+        let members = db.zrangebyscore("myzset", 2.0, 4.0).unwrap();
+        assert_eq!(members.len(), 0);
+    }
+
+    #[test]
+    fn test_zrangebyscore_with_timestamps() {
+        let (db, _temp) = test_db();
+
+        // Use Unix timestamps
+        let now = 1700000000.0;
+        db.zadd("scheduled", now, b"job1").unwrap();
+        db.zadd("scheduled", now + 60.0, b"job2").unwrap();
+        db.zadd("scheduled", now + 120.0, b"job3").unwrap();
+        db.zadd("scheduled", now + 180.0, b"job4").unwrap();
+
+        // Get jobs due in first 90 seconds
+        let members = db.zrangebyscore("scheduled", now, now + 90.0).unwrap();
+        assert_eq!(members.len(), 2);
+        assert_eq!(members[0], (b"job1".to_vec(), now));
+        assert_eq!(members[1], (b"job2".to_vec(), now + 60.0));
+    }
+
+    #[test]
+    fn test_zrangebyscore_nan_rejected() {
+        let (db, _temp) = test_db();
+
+        let result = db.zrangebyscore("myzset", f64::NAN, 10.0);
+        assert!(result.is_err());
+
+        let result = db.zrangebyscore("myzset", 0.0, f64::INFINITY);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_zrem() {
+        let (db, _temp) = test_db();
+
+        db.zadd("myzset", 1.0, b"one").unwrap();
+        db.zadd("myzset", 2.0, b"two").unwrap();
+        db.zadd("myzset", 3.0, b"three").unwrap();
+
+        // Remove existing member
+        let removed = db.zrem("myzset", b"two").unwrap();
+        assert_eq!(removed, 1);
+
+        // Verify removal
+        assert_eq!(db.zscore("myzset", b"two").unwrap(), None);
+        let members = db.zrange("myzset", 0, -1).unwrap();
+        assert_eq!(members.len(), 2);
+
+        // Remove nonexistent member
+        let removed = db.zrem("myzset", b"nonexistent").unwrap();
+        assert_eq!(removed, 0);
+    }
+
+    #[test]
+    fn test_zcard() {
+        let (db, _temp) = test_db();
+
+        // Empty set
+        assert_eq!(db.zcard("myzset").unwrap(), 0);
+
+        // Add members
+        db.zadd("myzset", 1.0, b"one").unwrap();
+        assert_eq!(db.zcard("myzset").unwrap(), 1);
+
+        db.zadd("myzset", 2.0, b"two").unwrap();
+        db.zadd("myzset", 3.0, b"three").unwrap();
+        assert_eq!(db.zcard("myzset").unwrap(), 3);
+
+        // Update existing (should not change cardinality)
+        db.zadd("myzset", 4.0, b"one").unwrap();
+        assert_eq!(db.zcard("myzset").unwrap(), 3);
+
+        // Remove member
+        db.zrem("myzset", b"two").unwrap();
+        assert_eq!(db.zcard("myzset").unwrap(), 2);
+    }
+
+    #[test]
+    fn test_sorted_set_isolation() {
+        let (db, _temp) = test_db();
+
+        // Add members to two different sets
+        db.zadd("zset1", 1.0, b"member1").unwrap();
+        db.zadd("zset2", 2.0, b"member2").unwrap();
+
+        // Check isolation
+        assert_eq!(db.zcard("zset1").unwrap(), 1);
+        assert_eq!(db.zcard("zset2").unwrap(), 1);
+
+        assert_eq!(db.zscore("zset1", b"member1").unwrap(), Some(1.0));
+        assert_eq!(db.zscore("zset1", b"member2").unwrap(), None);
+
+        assert_eq!(db.zscore("zset2", b"member2").unwrap(), Some(2.0));
+        assert_eq!(db.zscore("zset2", b"member1").unwrap(), None);
+    }
+
+    #[test]
+    fn test_score_encoding_correctness() {
+        // Test that score encoding preserves sort order
+        let scores = vec![-1000.0, -10.5, -1.0, -0.1, 0.0, 0.1, 1.0, 10.5, 1000.0];
+
+        let mut encoded: Vec<([u8; 8], f64)> =
+            scores.iter().map(|&s| (encode_score(s), s)).collect();
+
+        // Encoded bytes should sort in same order as original scores
+        encoded.sort_by(|a, b| a.0.cmp(&b.0));
+
+        for i in 0..encoded.len() {
+            // Verify decode gives back original
+            let decoded = decode_score(&encoded[i].0).unwrap();
+            assert!((decoded - encoded[i].1).abs() < f64::EPSILON);
+
+            // Verify order is preserved
+            if i > 0 {
+                assert!(encoded[i].1 >= encoded[i - 1].1);
+            }
+        }
+    }
+
+    #[test]
+    fn test_zadd_update_preserves_order() {
+        let (db, _temp) = test_db();
+
+        // Add members
+        db.zadd("myzset", 1.0, b"member1").unwrap();
+        db.zadd("myzset", 2.0, b"member2").unwrap();
+        db.zadd("myzset", 3.0, b"member3").unwrap();
+
+        // Update member2 to have highest score
+        db.zadd("myzset", 4.0, b"member2").unwrap();
+
+        // Verify order
+        let members = db.zrange("myzset", 0, -1).unwrap();
+        assert_eq!(members.len(), 3);
+        assert_eq!(members[0], (b"member1".to_vec(), 1.0));
+        assert_eq!(members[1], (b"member3".to_vec(), 3.0));
+        assert_eq!(members[2], (b"member2".to_vec(), 4.0));
     }
 }
