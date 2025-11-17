@@ -545,11 +545,15 @@ impl ListOps for Database {
     }
 
     async fn brpop(&self, key: &str, timeout_secs: u64) -> Result<Option<Vec<u8>>> {
+        // Cap timeout at 1 hour to prevent resource exhaustion
+        const MAX_TIMEOUT_SECS: u64 = 3600; // 1 hour
+
         let start = std::time::Instant::now();
         let timeout_duration = if timeout_secs == 0 {
             None
         } else {
-            Some(Duration::from_secs(timeout_secs))
+            let capped_timeout = timeout_secs.min(MAX_TIMEOUT_SECS);
+            Some(Duration::from_secs(capped_timeout))
         };
 
         // Get or create notifier for this key
@@ -557,7 +561,7 @@ impl ListOps for Database {
             let mut notifiers = self
                 .list_notifiers
                 .lock()
-                .map_err(|_| Error::Protocol("Failed to acquire notifier lock".to_string()))?;
+                .map_err(|e| Error::Protocol(format!("Failed to acquire notifier lock: {e}")))?;
             notifiers
                 .entry(key.to_string())
                 .or_insert_with(|| Arc::new(Notify::new()))
@@ -743,9 +747,13 @@ impl ListOps for Database {
         destination: &str,
         timeout_secs: u64,
     ) -> Result<Option<Vec<u8>>> {
+        // Cap timeout at 1 hour to prevent resource exhaustion
+        const MAX_TIMEOUT_SECS: u64 = 3600; // 1 hour
+
         let start = std::time::Instant::now();
         let timeout_duration = if timeout_secs > 0 {
-            Some(Duration::from_secs(timeout_secs))
+            let capped_timeout = timeout_secs.min(MAX_TIMEOUT_SECS);
+            Some(Duration::from_secs(capped_timeout))
         } else {
             None
         };
@@ -755,7 +763,7 @@ impl ListOps for Database {
             let mut notifiers = self
                 .list_notifiers
                 .lock()
-                .map_err(|_| Error::Protocol("Failed to acquire notifier lock".to_string()))?;
+                .map_err(|e| Error::Protocol(format!("Failed to acquire notifier lock: {e}")))?;
             notifiers
                 .entry(source.to_string())
                 .or_insert_with(|| Arc::new(Notify::new()))
