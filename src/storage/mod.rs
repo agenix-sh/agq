@@ -183,3 +183,92 @@ pub trait SortedSetOps {
     /// Returns an error if the database operation fails.
     fn zcard(&self, key: &str) -> Result<u64>;
 }
+
+/// Storage operations for hash (field-value map) data
+///
+/// Hashes store field-value pairs within a key, enabling structured data storage.
+/// Used for job metadata: job:<id> -> {status: "pending", stdout: "...", stderr: "..."}
+pub trait HashOps {
+    /// Set a field in a hash
+    ///
+    /// # Arguments
+    /// * `key` - The hash key (e.g., "job:123")
+    /// * `field` - The field name (e.g., "status")
+    /// * `value` - The field value
+    ///
+    /// # Returns
+    /// 1 if new field created, 0 if field updated
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the database operation fails.
+    fn hset(&self, key: &str, field: &str, value: &[u8]) -> Result<u64>;
+
+    /// Get a field value from a hash
+    ///
+    /// # Arguments
+    /// * `key` - The hash key
+    /// * `field` - The field name
+    ///
+    /// # Returns
+    /// Some(value) if field exists, None otherwise
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the database operation fails.
+    fn hget(&self, key: &str, field: &str) -> Result<Option<Vec<u8>>>;
+
+    /// Delete a field from a hash
+    ///
+    /// # Arguments
+    /// * `key` - The hash key
+    /// * `field` - The field name
+    ///
+    /// # Returns
+    /// 1 if field was deleted, 0 if field didn't exist
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the database operation fails.
+    fn hdel(&self, key: &str, field: &str) -> Result<u64>;
+
+    /// Get all field-value pairs from a hash
+    ///
+    /// # Arguments
+    /// * `key` - The hash key
+    ///
+    /// # Returns
+    /// Vector of (field, value) tuples
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the database operation fails.
+    fn hgetall(&self, key: &str) -> Result<Vec<(String, Vec<u8>)>>;
+
+    /// Check if a field exists in a hash
+    ///
+    /// # Arguments
+    /// * `key` - The hash key
+    /// * `field` - The field name
+    ///
+    /// # Returns
+    /// true if field exists, false otherwise
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the database operation fails.
+    fn hexists(&self, key: &str, field: &str) -> Result<bool>;
+
+    /// Get the number of fields in a hash
+    ///
+    /// # Arguments
+    /// * `key` - The hash key
+    ///
+    /// # Returns
+    /// Number of fields in the hash
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the database operation fails.
+    fn hlen(&self, key: &str) -> Result<u64>;
+}

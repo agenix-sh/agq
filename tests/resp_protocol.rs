@@ -662,3 +662,522 @@ async fn test_llen_empty_list() {
     let response = send_resp_command(&mut stream, llen_cmd).await;
     assert_eq!(&response, b":0\r\n", "LLEN on empty list should return 0");
 }
+
+#[tokio::test]
+async fn test_hset_and_hget() {
+    let (_handle, port) = start_test_server().await;
+    let mut stream = TcpStream::connect(format!("127.0.0.1:{port}"))
+        .await
+        .expect("Failed to connect");
+
+    // AUTH first
+    let auth_cmd = b"*2\r\n$4\r\nAUTH\r\n$32\r\ntest_session_key_32_bytes_long!!\r\n";
+    send_resp_command(&mut stream, auth_cmd).await;
+
+    // HSET myhash field1 value1: *4\r\n$4\r\nHSET\r\n$6\r\nmyhash\r\n$6\r\nfield1\r\n$6\r\nvalue1\r\n
+    let hset_cmd = b"*4\r\n$4\r\nHSET\r\n$6\r\nmyhash\r\n$6\r\nfield1\r\n$6\r\nvalue1\r\n";
+    let response = send_resp_command(&mut stream, hset_cmd).await;
+    assert_eq!(&response, b":1\r\n", "HSET new field should return 1");
+
+    // HGET myhash field1: *3\r\n$4\r\nHGET\r\n$6\r\nmyhash\r\n$6\r\nfield1\r\n
+    let hget_cmd = b"*3\r\n$4\r\nHGET\r\n$6\r\nmyhash\r\n$6\r\nfield1\r\n";
+    let response = send_resp_command(&mut stream, hget_cmd).await;
+    assert_eq!(
+        &response, b"$6\r\nvalue1\r\n",
+        "HGET should return stored value"
+    );
+}
+
+#[tokio::test]
+async fn test_hget_nonexistent_field() {
+    let (_handle, port) = start_test_server().await;
+    let mut stream = TcpStream::connect(format!("127.0.0.1:{port}"))
+        .await
+        .expect("Failed to connect");
+
+    // AUTH first
+    let auth_cmd = b"*2\r\n$4\r\nAUTH\r\n$32\r\ntest_session_key_32_bytes_long!!\r\n";
+    send_resp_command(&mut stream, auth_cmd).await;
+
+    // HGET nonexistent hash/field
+    let hget_cmd = b"*3\r\n$4\r\nHGET\r\n$11\r\nnonexistent\r\n$5\r\nfield\r\n";
+    let response = send_resp_command(&mut stream, hget_cmd).await;
+    assert_eq!(&response, b"$-1\r\n", "HGET nonexistent should return nil");
+}
+
+#[tokio::test]
+async fn test_hset_update_field() {
+    let (_handle, port) = start_test_server().await;
+    let mut stream = TcpStream::connect(format!("127.0.0.1:{port}"))
+        .await
+        .expect("Failed to connect");
+
+    // AUTH first
+    let auth_cmd = b"*2\r\n$4\r\nAUTH\r\n$32\r\ntest_session_key_32_bytes_long!!\r\n";
+    send_resp_command(&mut stream, auth_cmd).await;
+
+    // HSET new field
+    let hset_cmd = b"*4\r\n$4\r\nHSET\r\n$6\r\nmyhash\r\n$5\r\nfield\r\n$4\r\nold1\r\n";
+    let response = send_resp_command(&mut stream, hset_cmd).await;
+    assert_eq!(&response, b":1\r\n", "HSET new field should return 1");
+
+    // HSET update same field
+    let hset_cmd = b"*4\r\n$4\r\nHSET\r\n$6\r\nmyhash\r\n$5\r\nfield\r\n$4\r\nnew1\r\n";
+    let response = send_resp_command(&mut stream, hset_cmd).await;
+    assert_eq!(&response, b":0\r\n", "HSET update should return 0");
+
+    // HGET should return new value
+    let hget_cmd = b"*3\r\n$4\r\nHGET\r\n$6\r\nmyhash\r\n$5\r\nfield\r\n";
+    let response = send_resp_command(&mut stream, hget_cmd).await;
+    assert_eq!(
+        &response, b"$4\r\nnew1\r\n",
+        "HGET should return updated value"
+    );
+}
+
+#[tokio::test]
+async fn test_hdel() {
+    let (_handle, port) = start_test_server().await;
+    let mut stream = TcpStream::connect(format!("127.0.0.1:{port}"))
+        .await
+        .expect("Failed to connect");
+
+    // AUTH first
+    let auth_cmd = b"*2\r\n$4\r\nAUTH\r\n$32\r\ntest_session_key_32_bytes_long!!\r\n";
+    send_resp_command(&mut stream, auth_cmd).await;
+
+    // HSET field
+    let hset_cmd = b"*4\r\n$4\r\nHSET\r\n$6\r\nmyhash\r\n$5\r\nfield\r\n$5\r\nvalue\r\n";
+    send_resp_command(&mut stream, hset_cmd).await;
+
+    // HDEL field: *3\r\n$4\r\nHDEL\r\n$6\r\nmyhash\r\n$5\r\nfield\r\n
+    let hdel_cmd = b"*3\r\n$4\r\nHDEL\r\n$6\r\nmyhash\r\n$5\r\nfield\r\n";
+    let response = send_resp_command(&mut stream, hdel_cmd).await;
+    assert_eq!(
+        &response, b":1\r\n",
+        "HDEL should return 1 for deleted field"
+    );
+
+    // HDEL again - should return 0
+    let response = send_resp_command(&mut stream, hdel_cmd).await;
+    assert_eq!(
+        &response, b":0\r\n",
+        "HDEL nonexistent field should return 0"
+    );
+
+    // HGET should return nil
+    let hget_cmd = b"*3\r\n$4\r\nHGET\r\n$6\r\nmyhash\r\n$5\r\nfield\r\n";
+    let response = send_resp_command(&mut stream, hget_cmd).await;
+    assert_eq!(
+        &response, b"$-1\r\n",
+        "HGET deleted field should return nil"
+    );
+}
+
+#[tokio::test]
+async fn test_hexists() {
+    let (_handle, port) = start_test_server().await;
+    let mut stream = TcpStream::connect(format!("127.0.0.1:{port}"))
+        .await
+        .expect("Failed to connect");
+
+    // AUTH first
+    let auth_cmd = b"*2\r\n$4\r\nAUTH\r\n$32\r\ntest_session_key_32_bytes_long!!\r\n";
+    send_resp_command(&mut stream, auth_cmd).await;
+
+    // HEXISTS nonexistent: *3\r\n$7\r\nHEXISTS\r\n$6\r\nmyhash\r\n$5\r\nfield\r\n
+    let hexists_cmd = b"*3\r\n$7\r\nHEXISTS\r\n$6\r\nmyhash\r\n$5\r\nfield\r\n";
+    let response = send_resp_command(&mut stream, hexists_cmd).await;
+    assert_eq!(
+        &response, b":0\r\n",
+        "HEXISTS should return 0 for nonexistent field"
+    );
+
+    // HSET field
+    let hset_cmd = b"*4\r\n$4\r\nHSET\r\n$6\r\nmyhash\r\n$5\r\nfield\r\n$5\r\nvalue\r\n";
+    send_resp_command(&mut stream, hset_cmd).await;
+
+    // HEXISTS should return 1
+    let response = send_resp_command(&mut stream, hexists_cmd).await;
+    assert_eq!(
+        &response, b":1\r\n",
+        "HEXISTS should return 1 for existing field"
+    );
+}
+
+#[tokio::test]
+async fn test_hlen() {
+    let (_handle, port) = start_test_server().await;
+    let mut stream = TcpStream::connect(format!("127.0.0.1:{port}"))
+        .await
+        .expect("Failed to connect");
+
+    // AUTH first
+    let auth_cmd = b"*2\r\n$4\r\nAUTH\r\n$32\r\ntest_session_key_32_bytes_long!!\r\n";
+    send_resp_command(&mut stream, auth_cmd).await;
+
+    // HLEN empty hash: *2\r\n$4\r\nHLEN\r\n$6\r\nmyhash\r\n
+    let hlen_cmd = b"*2\r\n$4\r\nHLEN\r\n$6\r\nmyhash\r\n";
+    let response = send_resp_command(&mut stream, hlen_cmd).await;
+    assert_eq!(&response, b":0\r\n", "HLEN empty hash should return 0");
+
+    // HSET three fields
+    send_resp_command(
+        &mut stream,
+        b"*4\r\n$4\r\nHSET\r\n$6\r\nmyhash\r\n$6\r\nfield1\r\n$6\r\nvalue1\r\n",
+    )
+    .await;
+    send_resp_command(
+        &mut stream,
+        b"*4\r\n$4\r\nHSET\r\n$6\r\nmyhash\r\n$6\r\nfield2\r\n$6\r\nvalue2\r\n",
+    )
+    .await;
+    send_resp_command(
+        &mut stream,
+        b"*4\r\n$4\r\nHSET\r\n$6\r\nmyhash\r\n$6\r\nfield3\r\n$6\r\nvalue3\r\n",
+    )
+    .await;
+
+    // HLEN should return 3
+    let response = send_resp_command(&mut stream, hlen_cmd).await;
+    assert_eq!(&response, b":3\r\n", "HLEN should return 3");
+
+    // HDEL one field
+    send_resp_command(
+        &mut stream,
+        b"*3\r\n$4\r\nHDEL\r\n$6\r\nmyhash\r\n$6\r\nfield2\r\n",
+    )
+    .await;
+
+    // HLEN should return 2
+    let response = send_resp_command(&mut stream, hlen_cmd).await;
+    assert_eq!(&response, b":2\r\n", "HLEN after delete should return 2");
+}
+
+#[tokio::test]
+async fn test_hgetall() {
+    let (_handle, port) = start_test_server().await;
+    let mut stream = TcpStream::connect(format!("127.0.0.1:{port}"))
+        .await
+        .expect("Failed to connect");
+
+    // AUTH first
+    let auth_cmd = b"*2\r\n$4\r\nAUTH\r\n$32\r\ntest_session_key_32_bytes_long!!\r\n";
+    send_resp_command(&mut stream, auth_cmd).await;
+
+    // HGETALL empty hash: *2\r\n$7\r\nHGETALL\r\n$6\r\nmyhash\r\n
+    let hgetall_cmd = b"*2\r\n$7\r\nHGETALL\r\n$6\r\nmyhash\r\n";
+    let response = send_resp_command(&mut stream, hgetall_cmd).await;
+    assert_eq!(
+        &response, b"*0\r\n",
+        "HGETALL empty hash should return empty array"
+    );
+
+    // HSET two fields
+    send_resp_command(
+        &mut stream,
+        b"*4\r\n$4\r\nHSET\r\n$6\r\nmyhash\r\n$4\r\nkey1\r\n$6\r\nvalue1\r\n",
+    )
+    .await;
+    send_resp_command(
+        &mut stream,
+        b"*4\r\n$4\r\nHSET\r\n$6\r\nmyhash\r\n$4\r\nkey2\r\n$6\r\nvalue2\r\n",
+    )
+    .await;
+
+    // HGETALL should return all fields and values
+    let response = send_resp_command(&mut stream, hgetall_cmd).await;
+    let response_str = String::from_utf8_lossy(&response);
+    assert!(
+        response_str.starts_with("*4\r\n"),
+        "HGETALL should return array of 4 elements (2 fields + 2 values)"
+    );
+    assert!(
+        response_str.contains("key1") && response_str.contains("value1"),
+        "HGETALL should include key1/value1"
+    );
+    assert!(
+        response_str.contains("key2") && response_str.contains("value2"),
+        "HGETALL should include key2/value2"
+    );
+}
+
+#[tokio::test]
+async fn test_hash_isolation() {
+    let (_handle, port) = start_test_server().await;
+    let mut stream = TcpStream::connect(format!("127.0.0.1:{port}"))
+        .await
+        .expect("Failed to connect");
+
+    // AUTH first
+    let auth_cmd = b"*2\r\n$4\r\nAUTH\r\n$32\r\ntest_session_key_32_bytes_long!!\r\n";
+    send_resp_command(&mut stream, auth_cmd).await;
+
+    // HSET hash1 field value1
+    send_resp_command(
+        &mut stream,
+        b"*4\r\n$4\r\nHSET\r\n$5\r\nhash1\r\n$5\r\nfield\r\n$6\r\nvalue1\r\n",
+    )
+    .await;
+
+    // HSET hash2 field value2
+    send_resp_command(
+        &mut stream,
+        b"*4\r\n$4\r\nHSET\r\n$5\r\nhash2\r\n$5\r\nfield\r\n$6\r\nvalue2\r\n",
+    )
+    .await;
+
+    // HGET hash1 field should return value1
+    let hget_cmd = b"*3\r\n$4\r\nHGET\r\n$5\r\nhash1\r\n$5\r\nfield\r\n";
+    let response = send_resp_command(&mut stream, hget_cmd).await;
+    assert_eq!(&response, b"$6\r\nvalue1\r\n", "hash1 should have value1");
+
+    // HGET hash2 field should return value2
+    let hget_cmd = b"*3\r\n$4\r\nHGET\r\n$5\r\nhash2\r\n$5\r\nfield\r\n";
+    let response = send_resp_command(&mut stream, hget_cmd).await;
+    assert_eq!(&response, b"$6\r\nvalue2\r\n", "hash2 should have value2");
+}
+
+#[tokio::test]
+async fn test_hash_binary_values() {
+    let (_handle, port) = start_test_server().await;
+    let mut stream = TcpStream::connect(format!("127.0.0.1:{port}"))
+        .await
+        .expect("Failed to connect");
+
+    // AUTH first
+    let auth_cmd = b"*2\r\n$4\r\nAUTH\r\n$32\r\ntest_session_key_32_bytes_long!!\r\n";
+    send_resp_command(&mut stream, auth_cmd).await;
+
+    // HSET with binary data: *4\r\n$4\r\nHSET\r\n$6\r\nmyhash\r\n$6\r\nbinary\r\n$6\r\n\x00\x01\x02\xFF\xFE\xFD\r\n
+    let hset_cmd =
+        b"*4\r\n$4\r\nHSET\r\n$6\r\nmyhash\r\n$6\r\nbinary\r\n$6\r\n\x00\x01\x02\xFF\xFE\xFD\r\n";
+    let response = send_resp_command(&mut stream, hset_cmd).await;
+    assert_eq!(&response, b":1\r\n");
+
+    // HGET binary data
+    let hget_cmd = b"*3\r\n$4\r\nHGET\r\n$6\r\nmyhash\r\n$6\r\nbinary\r\n";
+    let response = send_resp_command(&mut stream, hget_cmd).await;
+    assert_eq!(
+        &response, b"$6\r\n\x00\x01\x02\xFF\xFE\xFD\r\n",
+        "Should store and retrieve binary data correctly"
+    );
+}
+
+#[tokio::test]
+async fn test_hash_job_metadata_use_case() {
+    let (_handle, port) = start_test_server().await;
+    let mut stream = TcpStream::connect(format!("127.0.0.1:{port}"))
+        .await
+        .expect("Failed to connect");
+
+    // AUTH first
+    let auth_cmd = b"*2\r\n$4\r\nAUTH\r\n$32\r\ntest_session_key_32_bytes_long!!\r\n";
+    send_resp_command(&mut stream, auth_cmd).await;
+
+    // Simulate job lifecycle
+    // HSET job:123 status pending
+    send_resp_command(
+        &mut stream,
+        b"*4\r\n$4\r\nHSET\r\n$7\r\njob:123\r\n$6\r\nstatus\r\n$7\r\npending\r\n",
+    )
+    .await;
+
+    // HSET job:123 created_at 1234567890
+    send_resp_command(
+        &mut stream,
+        b"*4\r\n$4\r\nHSET\r\n$7\r\njob:123\r\n$10\r\ncreated_at\r\n$10\r\n1234567890\r\n",
+    )
+    .await;
+
+    // Update status to running
+    send_resp_command(
+        &mut stream,
+        b"*4\r\n$4\r\nHSET\r\n$7\r\njob:123\r\n$6\r\nstatus\r\n$7\r\nrunning\r\n",
+    )
+    .await;
+
+    // Add stdout
+    send_resp_command(
+        &mut stream,
+        b"*4\r\n$4\r\nHSET\r\n$7\r\njob:123\r\n$6\r\nstdout\r\n$12\r\nHello World!\r\n",
+    )
+    .await;
+
+    // Check status
+    let hget_cmd = b"*3\r\n$4\r\nHGET\r\n$7\r\njob:123\r\n$6\r\nstatus\r\n";
+    let response = send_resp_command(&mut stream, hget_cmd).await;
+    assert_eq!(&response, b"$7\r\nrunning\r\n");
+
+    // Get all job metadata
+    let hgetall_cmd = b"*2\r\n$7\r\nHGETALL\r\n$7\r\njob:123\r\n";
+    let response = send_resp_command(&mut stream, hgetall_cmd).await;
+    let response_str = String::from_utf8_lossy(&response);
+
+    assert!(response_str.starts_with("*6\r\n"), "Should have 6 elements");
+    assert!(response_str.contains("status"));
+    assert!(response_str.contains("running"));
+    assert!(response_str.contains("created_at"));
+    assert!(response_str.contains("stdout"));
+    assert!(response_str.contains("Hello World!"));
+}
+
+// Security tests for hash operations
+#[tokio::test]
+async fn test_hash_requires_auth() {
+    let (_handle, port) = start_test_server().await;
+    let mut stream = TcpStream::connect(format!("127.0.0.1:{port}"))
+        .await
+        .expect("Failed to connect");
+
+    // Try HSET without auth
+    let hset_cmd = b"*4\r\n$4\r\nHSET\r\n$6\r\nmyhash\r\n$5\r\nfield\r\n$5\r\nvalue\r\n";
+    let response = send_resp_command(&mut stream, hset_cmd).await;
+    assert!(
+        response.starts_with(b"-ERR") && String::from_utf8_lossy(&response).contains("NOAUTH"),
+        "HSET without AUTH should return NOAUTH error"
+    );
+
+    // Try HGET without auth
+    let hget_cmd = b"*3\r\n$4\r\nHGET\r\n$6\r\nmyhash\r\n$5\r\nfield\r\n";
+    let response = send_resp_command(&mut stream, hget_cmd).await;
+    assert!(
+        response.starts_with(b"-ERR") && String::from_utf8_lossy(&response).contains("NOAUTH"),
+        "HGET without AUTH should return NOAUTH error"
+    );
+}
+
+#[tokio::test]
+async fn test_hash_invalid_arguments() {
+    let (_handle, port) = start_test_server().await;
+    let mut stream = TcpStream::connect(format!("127.0.0.1:{port}"))
+        .await
+        .expect("Failed to connect");
+
+    // AUTH first
+    let auth_cmd = b"*2\r\n$4\r\nAUTH\r\n$32\r\ntest_session_key_32_bytes_long!!\r\n";
+    send_resp_command(&mut stream, auth_cmd).await;
+
+    // HSET with too few arguments
+    let hset_cmd = b"*3\r\n$4\r\nHSET\r\n$6\r\nmyhash\r\n$5\r\nfield\r\n";
+    let response = send_resp_command(&mut stream, hset_cmd).await;
+    assert!(
+        response.starts_with(b"-ERR"),
+        "HSET with too few arguments should return error"
+    );
+
+    // HGET with too many arguments
+    let hget_cmd = b"*4\r\n$4\r\nHGET\r\n$6\r\nmyhash\r\n$5\r\nfield\r\n$5\r\nextra\r\n";
+    let response = send_resp_command(&mut stream, hget_cmd).await;
+    assert!(
+        response.starts_with(b"-ERR"),
+        "HGET with too many arguments should return error"
+    );
+
+    // HDEL with too few arguments
+    let hdel_cmd = b"*2\r\n$4\r\nHDEL\r\n$6\r\nmyhash\r\n";
+    let response = send_resp_command(&mut stream, hdel_cmd).await;
+    assert!(
+        response.starts_with(b"-ERR"),
+        "HDEL with too few arguments should return error"
+    );
+
+    // HLEN with too many arguments
+    let hlen_cmd = b"*3\r\n$4\r\nHLEN\r\n$6\r\nmyhash\r\n$5\r\nextra\r\n";
+    let response = send_resp_command(&mut stream, hlen_cmd).await;
+    assert!(
+        response.starts_with(b"-ERR"),
+        "HLEN with too many arguments should return error"
+    );
+}
+
+#[tokio::test]
+async fn test_hash_field_name_injection() {
+    let (_handle, port) = start_test_server().await;
+    let mut stream = TcpStream::connect(format!("127.0.0.1:{port}"))
+        .await
+        .expect("Failed to connect");
+
+    // AUTH first
+    let auth_cmd = b"*2\r\n$4\r\nAUTH\r\n$32\r\ntest_session_key_32_bytes_long!!\r\n";
+    send_resp_command(&mut stream, auth_cmd).await;
+
+    // Try field names with special characters that could be injection attempts
+    // Field with colon (used internally as separator)
+    let hset_cmd = b"*4\r\n$4\r\nHSET\r\n$6\r\nmyhash\r\n$10\r\nfield:test\r\n$5\r\nvalue\r\n";
+    let response = send_resp_command(&mut stream, hset_cmd).await;
+    assert_eq!(
+        &response, b":1\r\n",
+        "Field with colon should be allowed (properly escaped)"
+    );
+
+    // Verify it can be retrieved
+    let hget_cmd = b"*3\r\n$4\r\nHGET\r\n$6\r\nmyhash\r\n$10\r\nfield:test\r\n";
+    let response = send_resp_command(&mut stream, hget_cmd).await;
+    assert_eq!(
+        &response, b"$5\r\nvalue\r\n",
+        "Field with colon should be retrievable"
+    );
+
+    // Verify hash isolation (field:test shouldn't leak to other hashes)
+    let hget_cmd2 = b"*3\r\n$4\r\nHGET\r\n$9\r\notherhash\r\n$10\r\nfield:test\r\n";
+    let response = send_resp_command(&mut stream, hget_cmd2).await;
+    assert_eq!(
+        &response, b"$-1\r\n",
+        "Field should not exist in other hashes"
+    );
+}
+
+#[tokio::test]
+async fn test_hash_large_values() {
+    let (_handle, port) = start_test_server().await;
+    let mut stream = TcpStream::connect(format!("127.0.0.1:{port}"))
+        .await
+        .expect("Failed to connect");
+
+    // AUTH first
+    let auth_cmd = b"*2\r\n$4\r\nAUTH\r\n$32\r\ntest_session_key_32_bytes_long!!\r\n";
+    send_resp_command(&mut stream, auth_cmd).await;
+
+    // Test with reasonably large value (100KB)
+    let large_value = vec![b'X'; 100_000];
+    let value_len = format!("{}", large_value.len());
+
+    // Construct HSET command
+    let mut hset_cmd = Vec::new();
+    hset_cmd.extend_from_slice(b"*4\r\n$4\r\nHSET\r\n$6\r\nmyhash\r\n$5\r\nlarge\r\n$");
+    hset_cmd.extend_from_slice(value_len.as_bytes());
+    hset_cmd.extend_from_slice(b"\r\n");
+    hset_cmd.extend_from_slice(&large_value);
+    hset_cmd.extend_from_slice(b"\r\n");
+
+    let response = send_resp_command(&mut stream, &hset_cmd).await;
+    assert_eq!(
+        &response, b":1\r\n",
+        "Should handle large values (within reasonable limits)"
+    );
+
+    // Verify retrieval
+    let hget_cmd = b"*3\r\n$4\r\nHGET\r\n$6\r\nmyhash\r\n$5\r\nlarge\r\n";
+    stream.write_all(hget_cmd).await.expect("Failed to write");
+
+    // Read response (need larger buffer)
+    let mut response = vec![0u8; 150_000];
+    let n = stream.read(&mut response).await.expect("Failed to read");
+    response.truncate(n);
+
+    // Verify bulk string header
+    assert!(
+        response.starts_with(b"$100000\r\n"),
+        "Should return correct bulk string length"
+    );
+}
+
+// Note: The storage layer has limits on field value sizes (10MB) to prevent DoS attacks.
+// This is thoroughly tested in unit tests (test_hash_field_value_size_limit in storage/db.rs)
+// Integration testing of the 10MB limit is not practical here because:
+// 1. The RESP parser has its own message size limits
+// 2. The test helper uses a 1KB buffer which cannot handle multi-MB messages
+// 3. Testing large values is more appropriate at the storage layer
+//
+// The test_hash_large_values test above verifies 100KB values work correctly.

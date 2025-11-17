@@ -2,7 +2,7 @@
 
 use crate::error::{Error, Result};
 use crate::resp::{RespParser, RespValue};
-use crate::storage::{Database, ListOps, SortedSetOps, StringOps};
+use crate::storage::{Database, HashOps, ListOps, SortedSetOps, StringOps};
 use std::sync::Arc;
 use subtle::ConstantTimeEq;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -266,6 +266,42 @@ async fn handle_command(
                 return Err(Error::NoAuth);
             }
             handle_zcard(&args, db)
+        }
+        "HSET" => {
+            if !*authenticated {
+                return Err(Error::NoAuth);
+            }
+            handle_hset(&args, db)
+        }
+        "HGET" => {
+            if !*authenticated {
+                return Err(Error::NoAuth);
+            }
+            handle_hget(&args, db)
+        }
+        "HDEL" => {
+            if !*authenticated {
+                return Err(Error::NoAuth);
+            }
+            handle_hdel(&args, db)
+        }
+        "HGETALL" => {
+            if !*authenticated {
+                return Err(Error::NoAuth);
+            }
+            handle_hgetall(&args, db)
+        }
+        "HEXISTS" => {
+            if !*authenticated {
+                return Err(Error::NoAuth);
+            }
+            handle_hexists(&args, db)
+        }
+        "HLEN" => {
+            if !*authenticated {
+                return Err(Error::NoAuth);
+            }
+            handle_hlen(&args, db)
         }
         _ => {
             if !*authenticated {
@@ -719,6 +755,125 @@ fn handle_zcard(args: &[RespValue], db: &Database) -> Result<RespValue> {
 
     let key = args[1].as_string()?;
     let count = db.zcard(&key)?;
+    Ok(RespValue::Integer(count as i64))
+}
+
+/// Handle HSET command
+///
+/// Syntax: HSET key field value
+/// Returns: Integer - 1 if new field created, 0 if field updated
+fn handle_hset(args: &[RespValue], db: &Database) -> Result<RespValue> {
+    if args.len() != 4 {
+        return Err(Error::InvalidArguments(
+            "HSET requires exactly three arguments (key field value)".to_string(),
+        ));
+    }
+
+    let key = args[1].as_string()?;
+    let field = args[2].as_string()?;
+    let RespValue::BulkString(value) = &args[3] else {
+        return Err(Error::InvalidArguments(
+            "HSET value must be a bulk string".to_string(),
+        ));
+    };
+
+    let created = db.hset(&key, &field, value)?;
+    Ok(RespValue::Integer(created as i64))
+}
+
+/// Handle HGET command
+///
+/// Syntax: HGET key field
+/// Returns: Bulk string value or nil if field doesn't exist
+fn handle_hget(args: &[RespValue], db: &Database) -> Result<RespValue> {
+    if args.len() != 3 {
+        return Err(Error::InvalidArguments(
+            "HGET requires exactly two arguments (key field)".to_string(),
+        ));
+    }
+
+    let key = args[1].as_string()?;
+    let field = args[2].as_string()?;
+
+    match db.hget(&key, &field)? {
+        Some(value) => Ok(RespValue::BulkString(value)),
+        None => Ok(RespValue::NullBulkString),
+    }
+}
+
+/// Handle HDEL command
+///
+/// Syntax: HDEL key field
+/// Returns: Integer - 1 if field was deleted, 0 if field didn't exist
+fn handle_hdel(args: &[RespValue], db: &Database) -> Result<RespValue> {
+    if args.len() != 3 {
+        return Err(Error::InvalidArguments(
+            "HDEL requires exactly two arguments (key field)".to_string(),
+        ));
+    }
+
+    let key = args[1].as_string()?;
+    let field = args[2].as_string()?;
+
+    let deleted = db.hdel(&key, &field)?;
+    Ok(RespValue::Integer(deleted as i64))
+}
+
+/// Handle HGETALL command
+///
+/// Syntax: HGETALL key
+/// Returns: Array of alternating field/value pairs
+fn handle_hgetall(args: &[RespValue], db: &Database) -> Result<RespValue> {
+    if args.len() != 2 {
+        return Err(Error::InvalidArguments(
+            "HGETALL requires exactly one argument (key)".to_string(),
+        ));
+    }
+
+    let key = args[1].as_string()?;
+    let fields = db.hgetall(&key)?;
+
+    // Return array of alternating field/value pairs (Redis format)
+    let mut resp_elements = Vec::with_capacity(fields.len() * 2);
+    for (field, value) in fields {
+        resp_elements.push(RespValue::BulkString(field.into_bytes()));
+        resp_elements.push(RespValue::BulkString(value));
+    }
+
+    Ok(RespValue::Array(resp_elements))
+}
+
+/// Handle HEXISTS command
+///
+/// Syntax: HEXISTS key field
+/// Returns: Integer - 1 if field exists, 0 if it doesn't
+fn handle_hexists(args: &[RespValue], db: &Database) -> Result<RespValue> {
+    if args.len() != 3 {
+        return Err(Error::InvalidArguments(
+            "HEXISTS requires exactly two arguments (key field)".to_string(),
+        ));
+    }
+
+    let key = args[1].as_string()?;
+    let field = args[2].as_string()?;
+
+    let exists = db.hexists(&key, &field)?;
+    Ok(RespValue::Integer(i64::from(exists)))
+}
+
+/// Handle HLEN command
+///
+/// Syntax: HLEN key
+/// Returns: Integer - number of fields in hash
+fn handle_hlen(args: &[RespValue], db: &Database) -> Result<RespValue> {
+    if args.len() != 2 {
+        return Err(Error::InvalidArguments(
+            "HLEN requires exactly one argument (key)".to_string(),
+        ));
+    }
+
+    let key = args[1].as_string()?;
+    let count = db.hlen(&key)?;
     Ok(RespValue::Integer(count as i64))
 }
 
