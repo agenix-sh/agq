@@ -231,6 +231,18 @@ async fn handle_command(
             }
             handle_lrange(&args, db)
         }
+        "RPOPLPUSH" => {
+            if !*authenticated {
+                return Err(Error::NoAuth);
+            }
+            handle_rpoplpush(&args, db)
+        }
+        "BRPOPLPUSH" => {
+            if !*authenticated {
+                return Err(Error::NoAuth);
+            }
+            handle_brpoplpush(&args, db).await
+        }
         "ZADD" => {
             if !*authenticated {
                 return Err(Error::NoAuth);
@@ -587,6 +599,55 @@ fn handle_lrange(args: &[RespValue], db: &Database) -> Result<RespValue> {
     let resp_elements: Vec<RespValue> = elements.into_iter().map(RespValue::BulkString).collect();
 
     Ok(RespValue::Array(resp_elements))
+}
+
+/// Handle RPOPLPUSH command
+///
+/// Syntax: RPOPLPUSH source destination
+/// Returns: Bulk string value or nil if source list is empty
+///
+/// Atomically pops element from tail of source list and pushes to head of destination list.
+/// Both operations occur in a single transaction.
+fn handle_rpoplpush(args: &[RespValue], db: &Database) -> Result<RespValue> {
+    if args.len() != 3 {
+        return Err(Error::InvalidArguments(
+            "RPOPLPUSH requires exactly two arguments".to_string(),
+        ));
+    }
+
+    let source = args[1].as_string()?;
+    let destination = args[2].as_string()?;
+
+    match db.rpoplpush(&source, &destination)? {
+        Some(value) => Ok(RespValue::BulkString(value)),
+        None => Ok(RespValue::NullBulkString),
+    }
+}
+
+/// Handle BRPOPLPUSH command
+///
+/// Syntax: BRPOPLPUSH source destination timeout
+/// Returns: Bulk string value or nil if timeout
+///
+/// Blocking version of RPOPLPUSH. Waits for element to become available or timeout.
+async fn handle_brpoplpush(args: &[RespValue], db: &Database) -> Result<RespValue> {
+    if args.len() != 4 {
+        return Err(Error::InvalidArguments(
+            "BRPOPLPUSH requires exactly three arguments".to_string(),
+        ));
+    }
+
+    let source = args[1].as_string()?;
+    let destination = args[2].as_string()?;
+    let timeout_str = args[3].as_string()?;
+    let timeout_secs: u64 = timeout_str.parse().map_err(|_| {
+        Error::InvalidArguments("BRPOPLPUSH timeout must be a non-negative integer".to_string())
+    })?;
+
+    match db.brpoplpush(&source, &destination, timeout_secs).await? {
+        Some(value) => Ok(RespValue::BulkString(value)),
+        None => Ok(RespValue::NullBulkString),
+    }
 }
 
 /// Handle ZADD command

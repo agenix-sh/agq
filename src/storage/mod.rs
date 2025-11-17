@@ -85,6 +85,48 @@ pub trait ListOps {
     ///
     /// Returns an error if the database operation fails.
     fn lrange(&self, key: &str, start: i64, stop: i64) -> Result<Vec<Vec<u8>>>;
+
+    /// Atomically pop element from tail of source list and push to head of destination list
+    ///
+    /// # Arguments
+    /// * `source` - The list key to pop from
+    /// * `destination` - The list key to push to
+    ///
+    /// # Returns
+    /// The element that was moved, or None if source list is empty
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the database operation fails.
+    ///
+    /// # Atomicity
+    /// This operation is atomic - both pop and push occur in a single transaction.
+    /// If either operation fails, neither occurs (transaction rollback).
+    fn rpoplpush(&self, source: &str, destination: &str) -> Result<Option<Vec<u8>>>;
+
+    /// Blocking version of rpoplpush - atomically pop from source and push to destination
+    ///
+    /// # Arguments
+    /// * `source` - The list key to pop from
+    /// * `destination` - The list key to push to
+    /// * `timeout_secs` - Timeout in seconds (0 = block indefinitely)
+    ///
+    /// # Returns
+    /// The element that was moved, or None if timeout occurs
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the database operation fails.
+    ///
+    /// # Atomicity
+    /// This operation is atomic - both pop and push occur in a single transaction.
+    /// Blocks until source list has elements or timeout occurs.
+    async fn brpoplpush(
+        &self,
+        source: &str,
+        destination: &str,
+        timeout_secs: u64,
+    ) -> Result<Option<Vec<u8>>>;
 }
 
 /// Storage operations for sorted set data

@@ -1181,3 +1181,311 @@ async fn test_hash_large_values() {
 // 3. Testing large values is more appropriate at the storage layer
 //
 // The test_hash_large_values test above verifies 100KB values work correctly.
+
+// ============================================================================
+// RPOPLPUSH / BRPOPLPUSH Commands
+// ============================================================================
+
+#[tokio::test]
+async fn test_rpoplpush_basic() {
+    let (_handle, port) = start_test_server().await;
+    let mut stream = TcpStream::connect(format!("127.0.0.1:{port}"))
+        .await
+        .expect("Failed to connect");
+
+    // Authenticate
+    let auth_cmd = b"*2\r\n$4\r\nAUTH\r\n$32\r\ntest_session_key_32_bytes_long!!\r\n";
+    send_resp_command(&mut stream, auth_cmd).await;
+
+    // LPUSH source job1 job2
+    let lpush1_cmd = b"*3\r\n$5\r\nLPUSH\r\n$6\r\nsource\r\n$4\r\njob1\r\n";
+    send_resp_command(&mut stream, lpush1_cmd).await;
+
+    let lpush2_cmd = b"*3\r\n$5\r\nLPUSH\r\n$6\r\nsource\r\n$4\r\njob2\r\n";
+    send_resp_command(&mut stream, lpush2_cmd).await;
+
+    // RPOPLPUSH source destination
+    let rpoplpush_cmd = b"*3\r\n$9\r\nRPOPLPUSH\r\n$6\r\nsource\r\n$4\r\ndest\r\n";
+    let response = send_resp_command(&mut stream, rpoplpush_cmd).await;
+
+    // Should return "job1" (the tail element)
+    assert_eq!(
+        &response, b"$4\r\njob1\r\n",
+        "RPOPLPUSH should return tail element"
+    );
+
+    // Verify source now has 1 element
+    let llen_source_cmd = b"*2\r\n$4\r\nLLEN\r\n$6\r\nsource\r\n";
+    let response = send_resp_command(&mut stream, llen_source_cmd).await;
+    assert_eq!(&response, b":1\r\n", "Source should have 1 element");
+
+    // Verify destination has 1 element
+    let llen_dest_cmd = b"*2\r\n$4\r\nLLEN\r\n$4\r\ndest\r\n";
+    let response = send_resp_command(&mut stream, llen_dest_cmd).await;
+    assert_eq!(&response, b":1\r\n", "Destination should have 1 element");
+
+    // Verify destination element is job1
+    let rpop_dest_cmd = b"*2\r\n$4\r\nRPOP\r\n$4\r\ndest\r\n";
+    let response = send_resp_command(&mut stream, rpop_dest_cmd).await;
+    assert_eq!(&response, b"$4\r\njob1\r\n", "Destination should have job1");
+}
+
+#[tokio::test]
+async fn test_rpoplpush_empty_source() {
+    let (_handle, port) = start_test_server().await;
+    let mut stream = TcpStream::connect(format!("127.0.0.1:{port}"))
+        .await
+        .expect("Failed to connect");
+
+    // Authenticate
+    let auth_cmd = b"*2\r\n$4\r\nAUTH\r\n$32\r\ntest_session_key_32_bytes_long!!\r\n";
+    send_resp_command(&mut stream, auth_cmd).await;
+
+    // RPOPLPUSH on empty list
+    let rpoplpush_cmd = b"*3\r\n$9\r\nRPOPLPUSH\r\n$5\r\nempty\r\n$4\r\ndest\r\n";
+    let response = send_resp_command(&mut stream, rpoplpush_cmd).await;
+
+    // Should return nil
+    assert_eq!(
+        &response, b"$-1\r\n",
+        "RPOPLPUSH on empty list should return nil"
+    );
+}
+
+#[tokio::test]
+async fn test_rpoplpush_same_list() {
+    let (_handle, port) = start_test_server().await;
+    let mut stream = TcpStream::connect(format!("127.0.0.1:{port}"))
+        .await
+        .expect("Failed to connect");
+
+    // Authenticate
+    let auth_cmd = b"*2\r\n$4\r\nAUTH\r\n$32\r\ntest_session_key_32_bytes_long!!\r\n";
+    send_resp_command(&mut stream, auth_cmd).await;
+
+    // LPUSH mylist job1 job2 job3
+    let lpush1_cmd = b"*3\r\n$5\r\nLPUSH\r\n$6\r\nmylist\r\n$4\r\njob1\r\n";
+    send_resp_command(&mut stream, lpush1_cmd).await;
+
+    let lpush2_cmd = b"*3\r\n$5\r\nLPUSH\r\n$6\r\nmylist\r\n$4\r\njob2\r\n";
+    send_resp_command(&mut stream, lpush2_cmd).await;
+
+    let lpush3_cmd = b"*3\r\n$5\r\nLPUSH\r\n$6\r\nmylist\r\n$4\r\njob3\r\n";
+    send_resp_command(&mut stream, lpush3_cmd).await;
+
+    // RPOPLPUSH mylist mylist (list rotation)
+    let rpoplpush_cmd = b"*3\r\n$9\r\nRPOPLPUSH\r\n$6\r\nmylist\r\n$6\r\nmylist\r\n";
+    let response = send_resp_command(&mut stream, rpoplpush_cmd).await;
+
+    // Should return "job1" (tail element)
+    assert_eq!(&response, b"$4\r\njob1\r\n", "RPOPLPUSH should rotate list");
+
+    // Verify list still has 3 elements
+    let llen_cmd = b"*2\r\n$4\r\nLLEN\r\n$6\r\nmylist\r\n";
+    let response = send_resp_command(&mut stream, llen_cmd).await;
+    assert_eq!(&response, b":3\r\n", "List should still have 3 elements");
+
+    // Verify order is now job1, job3, job2
+    let lrange_cmd = b"*4\r\n$6\r\nLRANGE\r\n$6\r\nmylist\r\n$1\r\n0\r\n$2\r\n-1\r\n";
+    let response = send_resp_command(&mut stream, lrange_cmd).await;
+
+    // Response should be array with job1, job3, job2
+    assert!(response.starts_with(b"*3\r\n"), "Should return 3 elements");
+}
+
+#[tokio::test]
+async fn test_rpoplpush_reliable_queue_pattern() {
+    let (_handle, port) = start_test_server().await;
+    let mut stream = TcpStream::connect(format!("127.0.0.1:{port}"))
+        .await
+        .expect("Failed to connect");
+
+    // Authenticate
+    let auth_cmd = b"*2\r\n$4\r\nAUTH\r\n$32\r\ntest_session_key_32_bytes_long!!\r\n";
+    send_resp_command(&mut stream, auth_cmd).await;
+
+    // LPUSH ready job1
+    let lpush1_cmd = b"*3\r\n$5\r\nLPUSH\r\n$5\r\nready\r\n$4\r\njob1\r\n";
+    send_resp_command(&mut stream, lpush1_cmd).await;
+
+    // LPUSH ready job2
+    let lpush2_cmd = b"*3\r\n$5\r\nLPUSH\r\n$5\r\nready\r\n$4\r\njob2\r\n";
+    send_resp_command(&mut stream, lpush2_cmd).await;
+
+    // Worker picks up job: RPOPLPUSH ready processing
+    let rpoplpush_cmd = b"*3\r\n$9\r\nRPOPLPUSH\r\n$5\r\nready\r\n$10\r\nprocessing\r\n";
+    let response = send_resp_command(&mut stream, rpoplpush_cmd).await;
+
+    // Should return job1
+    assert_eq!(&response, b"$4\r\njob1\r\n", "Worker should pick up job1");
+
+    // Verify job1 is in processing queue
+    let llen_processing_cmd = b"*2\r\n$4\r\nLLEN\r\n$10\r\nprocessing\r\n";
+    let response = send_resp_command(&mut stream, llen_processing_cmd).await;
+    assert_eq!(&response, b":1\r\n", "Processing queue should have 1 job");
+
+    // On success, remove from processing
+    let rpop_cmd = b"*2\r\n$4\r\nRPOP\r\n$10\r\nprocessing\r\n";
+    let response = send_resp_command(&mut stream, rpop_cmd).await;
+    assert_eq!(&response, b"$4\r\njob1\r\n", "Should complete job1");
+
+    // Pick up job2: RPOPLPUSH ready processing
+    let rpoplpush_cmd2 = b"*3\r\n$9\r\nRPOPLPUSH\r\n$5\r\nready\r\n$10\r\nprocessing\r\n";
+    let response = send_resp_command(&mut stream, rpoplpush_cmd2).await;
+    assert_eq!(&response, b"$4\r\njob2\r\n", "Should pick up job2");
+
+    // Simulate failure recovery: RPOPLPUSH processing ready
+    let recovery_cmd = b"*3\r\n$9\r\nRPOPLPUSH\r\n$10\r\nprocessing\r\n$5\r\nready\r\n";
+    let response = send_resp_command(&mut stream, recovery_cmd).await;
+    assert_eq!(
+        &response, b"$4\r\njob2\r\n",
+        "Should recover job2 back to ready queue"
+    );
+}
+
+#[tokio::test]
+async fn test_brpoplpush_immediate() {
+    let (_handle, port) = start_test_server().await;
+    let mut stream = TcpStream::connect(format!("127.0.0.1:{port}"))
+        .await
+        .expect("Failed to connect");
+
+    // Authenticate
+    let auth_cmd = b"*2\r\n$4\r\nAUTH\r\n$32\r\ntest_session_key_32_bytes_long!!\r\n";
+    send_resp_command(&mut stream, auth_cmd).await;
+
+    // LPUSH source job1
+    let lpush_cmd = b"*3\r\n$5\r\nLPUSH\r\n$6\r\nsource\r\n$4\r\njob1\r\n";
+    send_resp_command(&mut stream, lpush_cmd).await;
+
+    // BRPOPLPUSH source dest 1 (should return immediately)
+    let brpoplpush_cmd = b"*4\r\n$10\r\nBRPOPLPUSH\r\n$6\r\nsource\r\n$4\r\ndest\r\n$1\r\n1\r\n";
+    let response = send_resp_command(&mut stream, brpoplpush_cmd).await;
+
+    // Should return immediately with job1
+    assert_eq!(
+        &response, b"$4\r\njob1\r\n",
+        "BRPOPLPUSH should return immediately when data available"
+    );
+}
+
+#[tokio::test]
+async fn test_brpoplpush_timeout() {
+    let (_handle, port) = start_test_server().await;
+    let mut stream = TcpStream::connect(format!("127.0.0.1:{port}"))
+        .await
+        .expect("Failed to connect");
+
+    // Authenticate
+    let auth_cmd = b"*2\r\n$4\r\nAUTH\r\n$32\r\ntest_session_key_32_bytes_long!!\r\n";
+    send_resp_command(&mut stream, auth_cmd).await;
+
+    // BRPOPLPUSH empty_list dest 1 (should timeout)
+    let start = std::time::Instant::now();
+    let brpoplpush_cmd =
+        b"*4\r\n$10\r\nBRPOPLPUSH\r\n$10\r\nempty_list\r\n$4\r\ndest\r\n$1\r\n1\r\n";
+    let response = send_resp_command(&mut stream, brpoplpush_cmd).await;
+
+    let elapsed = start.elapsed();
+
+    // Should return nil after timeout
+    assert_eq!(
+        &response, b"$-1\r\n",
+        "BRPOPLPUSH should return nil after timeout"
+    );
+
+    // Should take approximately 1 second
+    assert!(
+        elapsed.as_secs() >= 1 && elapsed.as_secs() < 2,
+        "Should timeout after approximately 1 second, took {:?}",
+        elapsed
+    );
+}
+
+#[tokio::test]
+async fn test_brpoplpush_notification() {
+    let (_handle, port) = start_test_server().await;
+    let mut stream1 = TcpStream::connect(format!("127.0.0.1:{port}"))
+        .await
+        .expect("Failed to connect");
+
+    let mut stream2 = TcpStream::connect(format!("127.0.0.1:{port}"))
+        .await
+        .expect("Failed to connect");
+
+    // Authenticate both connections
+    let auth_cmd = b"*2\r\n$4\r\nAUTH\r\n$32\r\ntest_session_key_32_bytes_long!!\r\n";
+    send_resp_command(&mut stream1, auth_cmd).await;
+    send_resp_command(&mut stream2, auth_cmd).await;
+
+    // Spawn task to block on BRPOPLPUSH
+    let handle = tokio::spawn(async move {
+        let brpoplpush_cmd =
+            b"*4\r\n$10\r\nBRPOPLPUSH\r\n$9\r\nwait_list\r\n$4\r\ndest\r\n$2\r\n10\r\n";
+        let response = send_resp_command(&mut stream1, brpoplpush_cmd).await;
+        response
+    });
+
+    // Give BRPOPLPUSH time to start waiting
+    tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+
+    // Push data from second connection
+    let lpush_cmd = b"*3\r\n$5\r\nLPUSH\r\n$9\r\nwait_list\r\n$4\r\ndata\r\n";
+    send_resp_command(&mut stream2, lpush_cmd).await;
+
+    // Wait for BRPOPLPUSH to complete
+    let response = tokio::time::timeout(tokio::time::Duration::from_secs(2), handle)
+        .await
+        .expect("BRPOPLPUSH should complete quickly")
+        .expect("Task should succeed");
+
+    // Should return the data
+    assert_eq!(
+        &response, b"$4\r\ndata\r\n",
+        "BRPOPLPUSH should be notified and return data"
+    );
+}
+
+#[tokio::test]
+async fn test_rpoplpush_invalid_args() {
+    let (_handle, port) = start_test_server().await;
+    let mut stream = TcpStream::connect(format!("127.0.0.1:{port}"))
+        .await
+        .expect("Failed to connect");
+
+    // Authenticate
+    let auth_cmd = b"*2\r\n$4\r\nAUTH\r\n$32\r\ntest_session_key_32_bytes_long!!\r\n";
+    send_resp_command(&mut stream, auth_cmd).await;
+
+    // RPOPLPUSH with only 1 argument (should fail)
+    let rpoplpush_cmd = b"*2\r\n$9\r\nRPOPLPUSH\r\n$6\r\nsource\r\n";
+    let response = send_resp_command(&mut stream, rpoplpush_cmd).await;
+
+    // Should return error
+    assert!(
+        response.starts_with(b"-ERR"),
+        "RPOPLPUSH with wrong number of args should error"
+    );
+}
+
+#[tokio::test]
+async fn test_brpoplpush_invalid_timeout() {
+    let (_handle, port) = start_test_server().await;
+    let mut stream = TcpStream::connect(format!("127.0.0.1:{port}"))
+        .await
+        .expect("Failed to connect");
+
+    // Authenticate
+    let auth_cmd = b"*2\r\n$4\r\nAUTH\r\n$32\r\ntest_session_key_32_bytes_long!!\r\n";
+    send_resp_command(&mut stream, auth_cmd).await;
+
+    // BRPOPLPUSH with invalid timeout
+    let brpoplpush_cmd = b"*4\r\n$10\r\nBRPOPLPUSH\r\n$6\r\nsource\r\n$4\r\ndest\r\n$3\r\nabc\r\n";
+    let response = send_resp_command(&mut stream, brpoplpush_cmd).await;
+
+    // Should return error
+    assert!(
+        response.starts_with(b"-ERR"),
+        "BRPOPLPUSH with invalid timeout should error"
+    );
+}
