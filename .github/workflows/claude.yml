@@ -29,6 +29,7 @@ jobs:
         uses: actions/checkout@v4
         with:
           fetch-depth: 1
+          submodules: recursive  # Load shared .claude/ config from agenix repo
 
       - name: Run Claude Code
         id: claude
