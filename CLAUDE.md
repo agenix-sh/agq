@@ -70,6 +70,26 @@ Per the spec, AGQ must:
 
 ---
 
+## 1.2 Shared Claude Code Skills & Agents
+
+This repository uses shared Claude Code configuration from the agenix repo (via git submodule at `agenix-shared/.claude/`):
+
+### Available Skills (Auto-Activated)
+- **agenix-architecture** - Enforces execution layer nomenclature (Task/Plan/Job/Action/Workflow)
+- **agenix-security** - OWASP Top 10, zero-trust principles, constant-time comparisons
+- **agenix-testing** - TDD practices, 80% coverage minimum, 100% for security-critical code
+- **rust-agenix-standards** - Rust error handling, async patterns, type safety idioms
+
+### Available Agents (Explicit Invocation)
+- **rust-engineer** - Deep Rust expertise for async, performance, safety
+- **security-auditor** - Vulnerability detection and prevention
+- **github-manager** - Issue/PR creation with proper templates and labels
+- **multi-repo-coordinator** - Cross-repository change coordination
+
+See `.claude/README.md` for detailed documentation on skill activation and agent usage.
+
+---
+
 ## 2. Development Workflow
 
 ### 2.1 Branch Strategy
