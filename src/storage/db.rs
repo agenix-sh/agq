@@ -636,46 +636,46 @@ impl ListOps for Database {
             let element = if let Some((head, tail)) = source_meta {
                 if head > tail {
                     // List is empty
-                    debug!("RPOPLPUSH {} {} -> source empty", source, destination);
-                    return Ok(None);
-                }
-
-                // Get tail element
-                let tail_key = list_element_key(source, tail);
-                let element = data_table
-                    .get(tail_key.as_str())
-                    .map_err(|e| Error::Protocol(format!("Failed to get tail element: {e}")))?
-                    .ok_or_else(|| {
-                        Error::Protocol("Tail element not found (data corruption)".to_string())
-                    })?
-                    .value()
-                    .to_vec();
-
-                // Remove tail element
-                data_table
-                    .remove(tail_key.as_str())
-                    .map_err(|e| Error::Protocol(format!("Failed to remove tail element: {e}")))?;
-
-                // Update tail pointer
-                let new_tail = tail - 1;
-                if new_tail < head {
-                    // List is now empty, remove metadata
-                    meta_table.remove(source).map_err(|e| {
-                        Error::Protocol(format!("Failed to remove source metadata: {e}"))
-                    })?;
+                    None
                 } else {
-                    // Update metadata with new tail
-                    let new_meta = encode_list_meta(head, new_tail);
-                    meta_table.insert(source, &new_meta[..]).map_err(|e| {
-                        Error::Protocol(format!("Failed to update source metadata: {e}"))
-                    })?;
-                }
+                    // Get tail element
+                    let tail_key = list_element_key(source, tail);
+                    let element = data_table
+                        .get(tail_key.as_str())
+                        .map_err(|e| Error::Protocol(format!("Failed to get tail element: {e}")))?
+                        .ok_or_else(|| {
+                            Error::Protocol("Tail element not found (data corruption)".to_string())
+                        })?
+                        .value()
+                        .to_vec();
 
-                Some(element)
+                    // Remove tail element
+                    data_table.remove(tail_key.as_str()).map_err(|e| {
+                        Error::Protocol(format!("Failed to remove tail element: {e}"))
+                    })?;
+
+                    // Update tail pointer with checked arithmetic
+                    let new_tail = tail
+                        .checked_sub(1)
+                        .ok_or_else(|| Error::Protocol("Tail index underflow".to_string()))?;
+                    if new_tail < head {
+                        // List is now empty, remove metadata
+                        meta_table.remove(source).map_err(|e| {
+                            Error::Protocol(format!("Failed to remove source metadata: {e}"))
+                        })?;
+                    } else {
+                        // Update metadata with new tail
+                        let new_meta = encode_list_meta(head, new_tail);
+                        meta_table.insert(source, &new_meta[..]).map_err(|e| {
+                            Error::Protocol(format!("Failed to update source metadata: {e}"))
+                        })?;
+                    }
+
+                    Some(element)
+                }
             } else {
                 // Source list doesn't exist
-                debug!("RPOPLPUSH {} {} -> source empty", source, destination);
-                return Ok(None);
+                None
             };
 
             // Step 2: If we got an element, LPUSH to destination
@@ -771,6 +771,20 @@ impl ListOps for Database {
         };
 
         loop {
+            // Check if we've exceeded timeout BEFORE attempting rpoplpush
+            // This minimizes the race window where data arrives between rpoplpush
+            // failing and the timeout check
+            if let Some(timeout) = timeout_duration {
+                let elapsed = start.elapsed();
+                if elapsed >= timeout {
+                    debug!(
+                        "BRPOPLPUSH {} {} -> timeout after {:?}",
+                        source, destination, elapsed
+                    );
+                    return Ok(None);
+                }
+            }
+
             // Try non-blocking rpoplpush
             if let Some(element) = self.rpoplpush(source, destination)? {
                 debug!(
@@ -782,16 +796,9 @@ impl ListOps for Database {
                 return Ok(Some(element));
             }
 
-            // Check if we've exceeded timeout
+            // Data not available, prepare to wait
             if let Some(timeout) = timeout_duration {
                 let elapsed = start.elapsed();
-                if elapsed >= timeout {
-                    debug!(
-                        "BRPOPLPUSH {} {} -> timeout after {:?}",
-                        source, destination, elapsed
-                    );
-                    return Ok(None);
-                }
 
                 // Wait for notification or timeout
                 let remaining = timeout - elapsed;
