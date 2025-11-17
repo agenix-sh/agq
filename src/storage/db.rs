@@ -221,14 +221,24 @@ fn list_element_key(list_key: &str, index: i64) -> String {
 /// Helper functions for sorted set operations
 /// Encode f64 score to sortable bytes
 /// Uses IEEE 754 with sign bit manipulation for proper sorting
+///
+/// IEEE 754 double format: [sign(1)] [exponent(11)] [mantissa(52)]
+/// Without modification, byte-level comparison would sort incorrectly:
+/// - Negative numbers have sign bit = 1, making them sort > positive
+/// - Among negatives, more negative values have larger magnitude bits
+///
+/// Solution:
+/// - For positive numbers (sign bit = 0): flip sign bit to 1
+///   This makes positive > negative in byte comparison
+/// - For negative numbers (sign bit = 1): flip ALL bits
+///   This inverts the magnitude, so more negative < less negative
 fn encode_score(score: f64) -> [u8; 8] {
     let bits = score.to_bits();
-    // Flip sign bit for negative numbers, or all bits if negative
     let sortable_bits = if (bits & (1u64 << 63)) != 0 {
-        // Negative: flip all bits
+        // Negative: flip all bits (inverts sign and magnitude)
         !bits
     } else {
-        // Positive: flip only sign bit
+        // Positive: flip only sign bit (makes it sort after negative)
         bits ^ (1u64 << 63)
     };
     sortable_bits.to_be_bytes()
@@ -637,23 +647,23 @@ impl SortedSetOps for Database {
             .open_table(ZSET_SCORE_TABLE)
             .map_err(|e| Error::Protocol(format!("Failed to open zset score table: {e}")))?;
 
-        // Collect all members for this sorted set
-        let prefix = format!("{}:", key);
+        // Collect all members for this sorted set using range query
+        // Use range query for O(M) performance where M = members in this set
+        // Instead of O(N) where N = all members across all sets
+        let start_key = format!("{}:", key);
+        let end_key = format!("{};", key); // ';' is ASCII next after ':'
         let mut members: Vec<(Vec<u8>, f64)> = Vec::new();
 
-        // Iterate through score table (already sorted by score)
+        // Range query: only scan keys for this specific sorted set
         for item in score_table
-            .iter()
-            .map_err(|e| Error::Protocol(format!("Failed to iterate score table: {e}")))?
+            .range(start_key.as_str()..end_key.as_str())
+            .map_err(|e| Error::Protocol(format!("Failed to create range query: {e}")))?
         {
             let (k, _) =
                 item.map_err(|e| Error::Protocol(format!("Failed to read score entry: {e}")))?;
             let key_str = k.value();
-
-            if key_str.starts_with(&prefix) {
-                let (member, score) = parse_score_key(key_str, prefix.len() - 1)?;
-                members.push((member, score));
-            }
+            let (member, score) = parse_score_key(key_str, key.len())?;
+            members.push((member, score));
         }
 
         if members.is_empty() {
@@ -664,17 +674,29 @@ impl SortedSetOps for Database {
 
         // Convert negative indices to positive
         let start_idx = if start < 0 {
-            (len + start).max(0) as usize
+            let idx = len + start;
+            if idx < 0 {
+                return Ok(vec![]); // Start is before beginning
+            }
+            idx as usize
         } else {
-            (start.min(len - 1)) as usize
+            if start >= len {
+                return Ok(vec![]); // Start is beyond end
+            }
+            start as usize
         };
 
         let stop_idx = if stop < 0 {
-            (len + stop).max(-1) as usize
+            let idx = len + stop;
+            if idx < 0 {
+                return Ok(vec![]); // Stop is before beginning
+            }
+            idx as usize
         } else {
             (stop.min(len - 1)) as usize
         };
 
+        // Return empty if range is invalid
         if start_idx > stop_idx {
             return Ok(vec![]);
         }
@@ -712,23 +734,22 @@ impl SortedSetOps for Database {
             .open_table(ZSET_SCORE_TABLE)
             .map_err(|e| Error::Protocol(format!("Failed to open zset score table: {e}")))?;
 
-        let prefix = format!("{}:", key);
+        // Use range query for O(M) performance where M = members in this set
+        let start_key = format!("{}:", key);
+        let end_key = format!("{};", key); // ';' is ASCII next after ':'
         let mut members: Vec<(Vec<u8>, f64)> = Vec::new();
 
-        // Iterate through score table and filter by score range
+        // Range query: only scan keys for this specific sorted set, then filter by score
         for item in score_table
-            .iter()
-            .map_err(|e| Error::Protocol(format!("Failed to iterate score table: {e}")))?
+            .range(start_key.as_str()..end_key.as_str())
+            .map_err(|e| Error::Protocol(format!("Failed to create range query: {e}")))?
         {
             let (k, _) =
                 item.map_err(|e| Error::Protocol(format!("Failed to read score entry: {e}")))?;
             let key_str = k.value();
-
-            if key_str.starts_with(&prefix) {
-                let (member, score) = parse_score_key(key_str, prefix.len() - 1)?;
-                if score >= min_score && score <= max_score {
-                    members.push((member, score));
-                }
+            let (member, score) = parse_score_key(key_str, key.len())?;
+            if score >= min_score && score <= max_score {
+                members.push((member, score));
             }
         }
 
@@ -827,21 +848,20 @@ impl SortedSetOps for Database {
             .open_table(ZSET_SCORE_TABLE)
             .map_err(|e| Error::Protocol(format!("Failed to open zset score table: {e}")))?;
 
-        let prefix = format!("{}:", key);
+        // Use range query for O(M) performance where M = members in this set
+        let start_key = format!("{}:", key);
+        let end_key = format!("{};", key); // ';' is ASCII next after ':'
         let mut count = 0u64;
 
         for item in score_table
-            .iter()
-            .map_err(|e| Error::Protocol(format!("Failed to iterate score table: {e}")))?
+            .range(start_key.as_str()..end_key.as_str())
+            .map_err(|e| Error::Protocol(format!("Failed to create range query: {e}")))?
         {
-            let (k, _) =
+            let _ =
                 item.map_err(|e| Error::Protocol(format!("Failed to read score entry: {e}")))?;
-            let key_str = k.value();
-            if key_str.starts_with(&prefix) {
-                count = count
-                    .checked_add(1)
-                    .ok_or_else(|| Error::Protocol("Count overflow".to_string()))?;
-            }
+            count = count
+                .checked_add(1)
+                .ok_or_else(|| Error::Protocol("Count overflow".to_string()))?;
         }
 
         debug!("ZCARD {} -> {}", key, count);
@@ -1382,5 +1402,69 @@ mod tests {
         assert_eq!(members[0], (b"member1".to_vec(), 1.0));
         assert_eq!(members[1], (b"member3".to_vec(), 3.0));
         assert_eq!(members[2], (b"member2".to_vec(), 4.0));
+    }
+
+    #[test]
+    fn test_zadd_update_removes_old_score_index() {
+        let (db, _temp) = test_db();
+
+        // Add member with initial score
+        db.zadd("myzset", 1.0, b"member").unwrap();
+
+        // Update to new score
+        let added = db.zadd("myzset", 2.0, b"member").unwrap();
+        assert_eq!(added, 0, "Should return 0 for update, not new member");
+
+        // Old score index should be removed - no results in old range
+        let members = db.zrangebyscore("myzset", 0.0, 1.5).unwrap();
+        assert_eq!(
+            members.len(),
+            0,
+            "Old score index should be removed, found {} members",
+            members.len()
+        );
+
+        // New score index should exist
+        let members = db.zrangebyscore("myzset", 1.5, 3.0).unwrap();
+        assert_eq!(
+            members.len(),
+            1,
+            "New score index should exist, found {} members",
+            members.len()
+        );
+        assert_eq!(members[0], (b"member".to_vec(), 2.0));
+
+        // Verify zscore returns updated value
+        assert_eq!(db.zscore("myzset", b"member").unwrap(), Some(2.0));
+
+        // Verify zcard still shows only 1 member
+        assert_eq!(db.zcard("myzset").unwrap(), 1);
+    }
+
+    #[test]
+    fn test_zrange_out_of_bounds() {
+        let (db, _temp) = test_db();
+
+        // Add 5 members (indices 0-4)
+        for i in 0..5 {
+            db.zadd("myzset", i as f64, format!("member{}", i).as_bytes())
+                .unwrap();
+        }
+
+        // Start index beyond length should return empty
+        let members = db.zrange("myzset", 10, 20).unwrap();
+        assert_eq!(members.len(), 0, "Out of bounds start should return empty");
+
+        // Start > stop should return empty
+        let members = db.zrange("myzset", 3, 1).unwrap();
+        assert_eq!(members.len(), 0, "Start > stop should return empty");
+
+        // Negative indices beyond range
+        let members = db.zrange("myzset", -100, -50).unwrap();
+        assert_eq!(
+            members.len(),
+            0,
+            "Invalid negative range should return empty"
+        );
     }
 }
