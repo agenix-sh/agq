@@ -1862,8 +1862,8 @@ async fn test_plan_submit_valid() {
     let auth_cmd = b"*2\r\n$4\r\nAUTH\r\n$32\r\ntest_session_key_32_bytes_long!!\r\n";
     send_resp_command(&mut stream, auth_cmd).await;
 
-    // Submit a valid plan (aligned with job-schema.md v0.2)
-    let plan_json = r#"{"job_id":"job_test123","plan_id":"plan_test456","tasks":[{"task_number":1,"command":"echo","args":["hello"]}]}"#;
+    // Submit a valid plan (Plan schema - Layer 2, no job_id)
+    let plan_json = r#"{"plan_id":"plan_test456","tasks":[{"task_number":1,"command":"echo","args":["hello"]}]}"#;
     let plan_json_len = plan_json.len();
     let cmd = format!(
         "*2\r\n$11\r\nPLAN.SUBMIT\r\n${}\r\n{}\r\n",
@@ -1896,7 +1896,7 @@ async fn test_plan_submit_invalid_json() {
     send_resp_command(&mut stream, auth_cmd).await;
 
     // Submit invalid JSON
-    let invalid_json = r#"{"job_id":"test","plan_id":"test","tasks":[{"task_number":1"#; // Malformed JSON
+    let invalid_json = r#"{"plan_id":"test","tasks":[{"task_number":1"#; // Malformed JSON
     let json_len = invalid_json.len();
     let cmd = format!(
         "*2\r\n$11\r\nPLAN.SUBMIT\r\n${}\r\n{}\r\n",
@@ -1928,8 +1928,8 @@ async fn test_plan_submit_missing_required_fields() {
     let auth_cmd = b"*2\r\n$4\r\nAUTH\r\n$32\r\ntest_session_key_32_bytes_long!!\r\n";
     send_resp_command(&mut stream, auth_cmd).await;
 
-    // Submit plan missing required fields (job_id, plan_id, tasks per job-schema.md)
-    let invalid_plan = r#"{"job_id":"test"}"#;
+    // Submit plan missing required fields (plan_id and tasks per Plan schema)
+    let invalid_plan = r#"{"plan_description":"test"}"#;
     let plan_len = invalid_plan.len();
     let cmd = format!(
         "*2\r\n$11\r\nPLAN.SUBMIT\r\n${}\r\n{}\r\n",
@@ -1960,7 +1960,7 @@ async fn test_plan_submit_missing_required_fields() {
 //     send_resp_command(&mut stream, auth_cmd).await;
 //
 //     // Submit a plan
-//     let plan_json = r#"{"job_id":"job_test","plan_id":"plan_test","tasks":[{"task_number":1,"command":"echo","args":["test"]}]}"#;
+//     let plan_json = r#"{"plan_id":"plan_test","tasks":[{"task_number":1,"command":"echo","args":["test"]}]}"#;
 //     let plan_json_len = plan_json.len();
 //     let cmd = format!(
 //         "*2\r\n$11\r\nPLAN.SUBMIT\r\n${}\r\n{}\r\n",
@@ -1990,9 +1990,9 @@ async fn test_plan_submit_requires_auth() {
         .await
         .expect("Failed to connect");
 
-    // Try PLAN.SUBMIT without authenticating (empty tasks will fail validation)
+    // Try PLAN.SUBMIT without authenticating
     let plan_json =
-        r#"{"job_id":"test","plan_id":"test","tasks":[{"task_number":1,"command":"test"}]}"#;
+        r#"{"plan_id":"test","tasks":[{"task_number":1,"command":"test"}]}"#;
     let plan_json_len = plan_json.len();
     let cmd = format!(
         "*2\r\n$11\r\nPLAN.SUBMIT\r\n${}\r\n{}\r\n",
@@ -2025,7 +2025,7 @@ async fn test_plan_submit_requires_auth() {
 //     // Create a large plan_description field to exceed limit
 //     let padding = "x".repeat(1_100_000); // 1.1MB of padding
 //     let plan_json = format!(
-//         r#"{{"job_id":"test","plan_id":"test","plan_description":"{}","tasks":[{{"task_number":1,"command":"echo","args":["test"]}}]}}"#,
+//         r#"{{"plan_id":"test","plan_description":"{}","tasks":[{{"task_number":1,"command":"echo","args":["test"]}}]}}"#,
 //         padding
 //     );
 //

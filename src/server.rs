@@ -1109,12 +1109,15 @@ fn handle_hlen(args: &[RespValue], db: &Database) -> Result<RespValue> {
 /// Maximum plan JSON size (1MB)
 const MAX_PLAN_SIZE: usize = 1024 * 1024;
 
-/// Plan JSON schema for validation (aligned with job-schema.md v0.2)
+/// Plan JSON schema for validation (Layer 2 - Plan templates)
 ///
-/// Validates Plans according to the canonical Job Envelope specification.
-/// Reference: agenix/docs/architecture/job-schema.md
+/// Validates Plan definitions submitted via PLAN.SUBMIT.
+/// Plans are templates that are stored and later used to create Jobs.
 ///
-/// A Plan contains a job_id, plan_id, optional description, and ordered Tasks.
+/// **IMPORTANT**: This is the Plan schema (Layer 2), NOT the Job schema (Layer 3).
+/// - Plans do NOT have job_id (that's added when AGQ creates Jobs from Plans)
+/// - Plans have plan_id, description, and tasks
+/// - Jobs have job_id, plan_id, description, and tasks (see job-schema.md)
 ///
 /// # Security Constraints
 /// - Maximum 100 tasks per plan (per canonical spec)
@@ -1125,13 +1128,8 @@ const MAX_PLAN_SIZE: usize = 1024 * 1024;
 const PLAN_SCHEMA: &str = r#"{
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "type": "object",
-  "required": ["job_id", "plan_id", "tasks"],
+  "required": ["plan_id", "tasks"],
   "properties": {
-    "job_id": {
-      "type": "string",
-      "minLength": 1,
-      "maxLength": 64
-    },
     "plan_id": {
       "type": "string",
       "minLength": 1,
