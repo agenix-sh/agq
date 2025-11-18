@@ -4,6 +4,10 @@ use crate::error::{Error, Result};
 use crate::resp::{RespParser, RespValue};
 use crate::storage::{Database, HashOps, ListOps, SortedSetOps, StringOps};
 use crate::workers::InternalJob;
+use governor::Quota;
+use jsonschema::JSONSchema;
+use once_cell::sync::Lazy;
+use std::num::NonZeroU32;
 use std::sync::Arc;
 use subtle::ConstantTimeEq;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -1106,39 +1110,93 @@ fn handle_hlen(args: &[RespValue], db: &Database) -> Result<RespValue> {
 const MAX_PLAN_SIZE: usize = 1024 * 1024;
 
 /// Plan JSON schema for validation
+///
+/// Validates Plans according to EXECUTION-LAYERS.md nomenclature.
+/// A Plan contains an ordered list of Tasks (atomic execution units).
+///
+/// # Security Constraints
+/// - Maximum 1000 tasks per plan (prevents resource exhaustion)
+/// - Maximum 256 characters for IDs and tool names
+/// - Maximum 100 args per task
+/// - Maximum 65KB per arg (prevents memory exhaustion)
 const PLAN_SCHEMA: &str = r#"{
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "type": "object",
-  "required": ["version", "steps"],
+  "required": ["version", "tasks"],
   "properties": {
     "version": {
-      "type": "string"
+      "type": "string",
+      "maxLength": 32
     },
     "metadata": {
       "type": "object"
     },
-    "steps": {
+    "tasks": {
       "type": "array",
+      "maxItems": 1000,
       "items": {
         "type": "object",
         "required": ["id", "tool", "args"],
         "properties": {
-          "id": { "type": "string" },
-          "tool": { "type": "string" },
+          "id": {
+            "type": "string",
+            "maxLength": 256
+          },
+          "tool": {
+            "type": "string",
+            "maxLength": 256
+          },
           "args": {
             "type": "array",
-            "items": { "type": "string" }
+            "maxItems": 100,
+            "items": {
+              "type": "string",
+              "maxLength": 65536
+            }
           },
           "env": {
             "type": "object",
-            "additionalProperties": { "type": "string" }
+            "maxProperties": 100,
+            "additionalProperties": {
+              "type": "string",
+              "maxLength": 65536
+            }
           },
-          "input": { "type": "string" }
+          "input": {
+            "type": "string",
+            "maxLength": 1048576
+          }
         }
       }
     }
   }
 }"#;
+
+/// Lazily compiled JSON schema validator for Plan validation
+///
+/// Compiled once at first use to avoid overhead on every request.
+/// Validates against PLAN_SCHEMA defined above.
+static PLAN_VALIDATOR: Lazy<JSONSchema> = Lazy::new(|| {
+    let schema: serde_json::Value =
+        serde_json::from_str(PLAN_SCHEMA).expect("PLAN_SCHEMA must be valid JSON");
+    JSONSchema::compile(&schema).expect("PLAN_SCHEMA must compile successfully")
+});
+
+/// Rate limiter for PLAN.SUBMIT command (1000 plans per minute globally)
+///
+/// Prevents flooding the internal queue with plan submissions.
+/// Uses governor crate for token bucket rate limiting.
+///
+/// # Rate Limit
+/// - 1000 plans/minute globally (~16.7 plans/second)
+/// - Returns RateLimitExceeded error when exceeded
+static PLAN_SUBMIT_LIMITER: Lazy<
+    governor::RateLimiter<
+        governor::state::direct::NotKeyed,
+        governor::state::InMemoryState,
+        governor::clock::DefaultClock,
+    >,
+> = Lazy::new(|| governor::RateLimiter::direct(Quota::per_minute(NonZeroU32::new(1000).unwrap())));
 
 /// Handle PLAN.SUBMIT command
 ///
@@ -1157,6 +1215,14 @@ const PLAN_SCHEMA: &str = r#"{
 /// 3. Push to internal queue (agq:internal:plan.submit)
 /// 4. Return plan_id immediately (async processing)
 fn handle_plan_submit(args: &[RespValue], db: &Database) -> Result<RespValue> {
+    // Security: Check rate limit before processing
+    if PLAN_SUBMIT_LIMITER.check().is_err() {
+        warn!("PLAN.SUBMIT rate limit exceeded");
+        return Err(Error::Protocol(
+            "Rate limit exceeded for PLAN.SUBMIT (max 1000/minute)".to_string(),
+        ));
+    }
+
     // Validate arguments
     if args.len() != 2 {
         return Err(Error::InvalidArguments(
@@ -1178,14 +1244,8 @@ fn handle_plan_submit(args: &[RespValue], db: &Database) -> Result<RespValue> {
     let plan_value: serde_json::Value = serde_json::from_str(&plan_json)
         .map_err(|e| Error::InvalidArguments(format!("Invalid JSON: {}", e)))?;
 
-    // Validate against Plan schema
-    let schema: serde_json::Value = serde_json::from_str(PLAN_SCHEMA)
-        .map_err(|e| Error::Protocol(format!("Internal schema error: {}", e)))?;
-
-    let validator = jsonschema::JSONSchema::compile(&schema)
-        .map_err(|e| Error::Protocol(format!("Schema validation setup error: {}", e)))?;
-
-    if let Err(errors) = validator.validate(&plan_value) {
+    // Validate against Plan schema (using lazy-compiled validator)
+    if let Err(errors) = PLAN_VALIDATOR.validate(&plan_value) {
         let error_msgs: Vec<String> = errors.map(|e| format!("{}", e)).collect();
         return Err(Error::InvalidArguments(format!(
             "Plan validation failed: {}",

@@ -1863,7 +1863,7 @@ async fn test_plan_submit_valid() {
     send_resp_command(&mut stream, auth_cmd).await;
 
     // Submit a valid plan
-    let plan_json = r#"{"version":"1.0","steps":[{"id":"step1","tool":"echo","args":["hello"]}]}"#;
+    let plan_json = r#"{"version":"1.0","tasks":[{"id":"task1","tool":"echo","args":["hello"]}]}"#;
     let plan_json_len = plan_json.len();
     let cmd = format!(
         "*2\r\n$11\r\nPLAN.SUBMIT\r\n${}\r\n{}\r\n",
@@ -1896,7 +1896,7 @@ async fn test_plan_submit_invalid_json() {
     send_resp_command(&mut stream, auth_cmd).await;
 
     // Submit invalid JSON
-    let invalid_json = r#"{"version":"1.0","steps":[{"id":"step1"#; // Malformed JSON
+    let invalid_json = r#"{"version":"1.0","tasks":[{"id":"task1"#; // Malformed JSON
     let json_len = invalid_json.len();
     let cmd = format!(
         "*2\r\n$11\r\nPLAN.SUBMIT\r\n${}\r\n{}\r\n",
@@ -1928,7 +1928,7 @@ async fn test_plan_submit_missing_required_fields() {
     let auth_cmd = b"*2\r\n$4\r\nAUTH\r\n$32\r\ntest_session_key_32_bytes_long!!\r\n";
     send_resp_command(&mut stream, auth_cmd).await;
 
-    // Submit plan missing required "steps" field
+    // Submit plan missing required "tasks" field
     let invalid_plan = r#"{"version":"1.0"}"#;
     let plan_len = invalid_plan.len();
     let cmd = format!(
@@ -1960,7 +1960,7 @@ async fn test_plan_submit_missing_required_fields() {
 //     send_resp_command(&mut stream, auth_cmd).await;
 //
 //     // Submit a plan
-//     let plan_json = r#"{"version":"1.0","steps":[{"id":"step1","tool":"echo","args":["test"]}]}"#;
+//     let plan_json = r#"{"version":"1.0","tasks":[{"id":"task1","tool":"echo","args":["test"]}]}"#;
 //     let plan_json_len = plan_json.len();
 //     let cmd = format!(
 //         "*2\r\n$11\r\nPLAN.SUBMIT\r\n${}\r\n{}\r\n",
@@ -1991,7 +1991,7 @@ async fn test_plan_submit_requires_auth() {
         .expect("Failed to connect");
 
     // Try PLAN.SUBMIT without authenticating
-    let plan_json = r#"{"version":"1.0","steps":[]}"#;
+    let plan_json = r#"{"version":"1.0","tasks":[]}"#;
     let plan_json_len = plan_json.len();
     let cmd = format!(
         "*2\r\n$11\r\nPLAN.SUBMIT\r\n${}\r\n{}\r\n",
@@ -2024,7 +2024,7 @@ async fn test_plan_submit_requires_auth() {
 //     // Create a large metadata field to exceed limit
 //     let padding = "x".repeat(1_100_000); // 1.1MB of padding
 //     let plan_json = format!(
-//         r#"{{"version":"1.0","metadata":{{"padding":"{}"}},"steps":[{{"id":"step1","tool":"echo","args":["test"]}}]}}"#,
+//         r#"{{"version":"1.0","metadata":{{"padding":"{}"}},"tasks":[{{"id":"task1","tool":"echo","args":["test"]}}]}}"#,
 //         padding
 //     );
 //

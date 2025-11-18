@@ -183,7 +183,7 @@ mod tests {
             id: "job123".to_string(),
             operation: "plan.submit".to_string(),
             entity_id: "plan_test123".to_string(),
-            payload: r#"{"version":"1.0","steps":[]}"#.to_string(),
+            payload: r#"{"version":"1.0","tasks":[]}"#.to_string(),
             timestamp: 1700000000,
             retry_count: 0,
             max_retries: 3,
@@ -195,7 +195,7 @@ mod tests {
         let json = db.hget("plan:plan_test123", "json").unwrap().unwrap();
         assert_eq!(
             std::str::from_utf8(&json).unwrap(),
-            r#"{"version":"1.0","steps":[]}"#
+            r#"{"version":"1.0","tasks":[]}"#
         );
 
         let status = db.hget("plan:plan_test123", "status").unwrap().unwrap();
@@ -224,7 +224,7 @@ mod tests {
             id: "job456".to_string(),
             operation: "plan.submit".to_string(),
             entity_id: "plan_test456".to_string(),
-            payload: r#"{"version":"1.0","steps":[]}"#.to_string(),
+            payload: r#"{"version":"1.0","tasks":[]}"#.to_string(),
             timestamp: 1700000001,
             retry_count: 0,
             max_retries: 3,
@@ -241,7 +241,7 @@ mod tests {
         let json = db.hget("plan:plan_test456", "json").unwrap().unwrap();
         assert_eq!(
             std::str::from_utf8(&json).unwrap(),
-            r#"{"version":"1.0","steps":[]}"#
+            r#"{"version":"1.0","tasks":[]}"#
         );
 
         // Verify processing queue is empty
