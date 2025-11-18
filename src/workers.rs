@@ -183,7 +183,8 @@ mod tests {
             id: "job123".to_string(),
             operation: "plan.submit".to_string(),
             entity_id: "plan_test123".to_string(),
-            payload: r#"{"plan_id":"plan_test123","tasks":[{"task_number":1,"command":"test"}]}"#.to_string(),
+            payload: r#"{"plan_id":"plan_test123","tasks":[{"task_number":1,"command":"test"}]}"#
+                .to_string(),
             timestamp: 1700000000,
             retry_count: 0,
             max_retries: 3,
@@ -224,7 +225,8 @@ mod tests {
             id: "job456".to_string(),
             operation: "plan.submit".to_string(),
             entity_id: "plan_test456".to_string(),
-            payload: r#"{"plan_id":"plan_test456","tasks":[{"task_number":1,"command":"test"}]}"#.to_string(),
+            payload: r#"{"plan_id":"plan_test456","tasks":[{"task_number":1,"command":"test"}]}"#
+                .to_string(),
             timestamp: 1700000001,
             retry_count: 0,
             max_retries: 3,

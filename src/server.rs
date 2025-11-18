@@ -333,6 +333,12 @@ async fn handle_command(
             }
             handle_plan_submit(&args, db)
         }
+        "ACTION.SUBMIT" => {
+            if !*authenticated {
+                return Err(Error::NoAuth);
+            }
+            handle_action_submit(&args, db)
+        }
         _ => {
             if !*authenticated {
                 return Err(Error::NoAuth);
@@ -1287,6 +1293,173 @@ fn handle_plan_submit(args: &[RespValue], db: &Database) -> Result<RespValue> {
 
     // Return plan_id immediately (processing continues asynchronously)
     Ok(RespValue::BulkString(plan_id.into_bytes()))
+}
+
+/// Handle ACTION.SUBMIT command (Layer 4 - Action execution)
+///
+/// Syntax: ACTION.SUBMIT <action_json>
+/// Returns: JSON response with action_id and created job_ids
+///
+/// # Action JSON Format
+/// ```json
+/// {
+///   "action_id": "action-uuid",
+///   "plan_id": "plan-uuid",
+///   "inputs": [
+///     {"file": "/path/to/file1.txt"},
+///     {"file": "/path/to/file2.txt"}
+///   ]
+/// }
+/// ```
+///
+/// # Implementation
+/// 1. Validate action JSON structure
+/// 2. Verify plan_id exists in database
+/// 3. Create N Jobs (one per input in inputs array)
+/// 4. Each Job = Plan template + job_id + specific input data
+/// 5. Enqueue Jobs to queue:ready for worker dispatch
+/// 6. Return action summary
+///
+/// # Security
+/// - Validates JSON structure
+/// - Verifies Plan exists before creating Jobs
+/// - Enforces maximum inputs limit (100 per Action)
+/// - Rate limited (shares PLAN_SUBMIT limiter)
+fn handle_action_submit(args: &[RespValue], db: &Database) -> Result<RespValue> {
+    // Security: Check rate limit (reuse PLAN_SUBMIT limiter for now)
+    if PLAN_SUBMIT_LIMITER.check().is_err() {
+        warn!("ACTION.SUBMIT rate limit exceeded");
+        return Err(Error::Protocol(
+            "Rate limit exceeded for ACTION.SUBMIT (max 1000/minute)".to_string(),
+        ));
+    }
+
+    // Validate arguments
+    if args.len() != 2 {
+        return Err(Error::InvalidArguments(
+            "ACTION.SUBMIT requires exactly one argument (action JSON)".to_string(),
+        ));
+    }
+
+    let action_json = args[1].as_string()?;
+
+    // Parse action JSON
+    let action_value: serde_json::Value = serde_json::from_str(&action_json)
+        .map_err(|e| Error::InvalidArguments(format!("Invalid JSON: {}", e)))?;
+
+    // Extract required fields
+    let action_id = action_value["action_id"]
+        .as_str()
+        .ok_or_else(|| Error::InvalidArguments("Missing required field: action_id".to_string()))?;
+
+    let plan_id = action_value["plan_id"]
+        .as_str()
+        .ok_or_else(|| Error::InvalidArguments("Missing required field: plan_id".to_string()))?;
+
+    let inputs = action_value["inputs"].as_array().ok_or_else(|| {
+        Error::InvalidArguments("Missing or invalid field: inputs (must be array)".to_string())
+    })?;
+
+    // Security: Enforce maximum inputs limit
+    if inputs.is_empty() {
+        return Err(Error::InvalidArguments(
+            "inputs array must contain at least one input".to_string(),
+        ));
+    }
+
+    if inputs.len() > 100 {
+        return Err(Error::InvalidArguments(
+            "inputs array exceeds maximum of 100 inputs per Action".to_string(),
+        ));
+    }
+
+    // Verify Plan exists
+    let plan_key = format!("plan:{}", plan_id);
+    let plan_exists = db.exists(&plan_key)?;
+    if !plan_exists {
+        return Err(Error::InvalidArguments(format!(
+            "Plan not found: {}",
+            plan_id
+        )));
+    }
+
+    // Retrieve Plan JSON
+    let plan_json_bytes = db
+        .hget(&plan_key, "json")?
+        .ok_or_else(|| Error::Protocol(format!("Plan {} has no JSON data", plan_id)))?;
+
+    let plan_json = std::str::from_utf8(&plan_json_bytes)
+        .map_err(|e| Error::Protocol(format!("Plan JSON is not valid UTF-8: {}", e)))?;
+
+    let plan_value: serde_json::Value = serde_json::from_str(plan_json)
+        .map_err(|e| Error::Protocol(format!("Plan JSON is invalid: {}", e)))?;
+
+    // Create Jobs (one per input)
+    let mut job_ids = Vec::new();
+
+    for (idx, input) in inputs.iter().enumerate() {
+        // Generate unique job_id
+        let job_id = format!("job_{}", Uuid::new_v4().simple());
+
+        // Create Job = Plan + job_id + input
+        // Per Layer 2→3 transition: Plans don't have job_id, Jobs do
+        let mut job_value = plan_value.clone();
+        job_value["job_id"] = serde_json::Value::String(job_id.clone());
+        job_value["input"] = input.clone();
+        job_value["input_index"] = serde_json::Value::Number(idx.into());
+
+        // Serialize Job to JSON
+        let job_json = serde_json::to_string(&job_value)
+            .map_err(|e| Error::Protocol(format!("Failed to serialize Job: {}", e)))?;
+
+        // Enqueue Job to queue:ready
+        db.lpush("queue:ready", job_json.as_bytes())?;
+
+        // Store Job metadata in hash
+        let job_key = format!("job:{}", job_id);
+        db.hset(&job_key, "action_id", action_id.as_bytes())?;
+        db.hset(&job_key, "plan_id", plan_id.as_bytes())?;
+        db.hset(&job_key, "status", b"pending")?;
+        let timestamp = get_current_timestamp_secs()?;
+        db.hset(&job_key, "created_at", timestamp.to_string().as_bytes())?;
+
+        // Index Job by action_id (for querying jobs by action)
+        let action_jobs_key = format!("action:{}:jobs", action_id);
+        db.lpush(&action_jobs_key, job_id.as_bytes())?;
+
+        job_ids.push(job_id);
+    }
+
+    // Store Action metadata
+    let action_key = format!("action:{}", action_id);
+    db.hset(&action_key, "plan_id", plan_id.as_bytes())?;
+    db.hset(
+        &action_key,
+        "jobs_created",
+        job_ids.len().to_string().as_bytes(),
+    )?;
+    db.hset(&action_key, "status", b"running")?;
+    let timestamp = get_current_timestamp_secs()?;
+    db.hset(&action_key, "created_at", timestamp.to_string().as_bytes())?;
+
+    // Build response JSON
+    let response = serde_json::json!({
+        "action_id": action_id,
+        "plan_id": plan_id,
+        "jobs_created": job_ids.len(),
+        "job_ids": job_ids
+    });
+
+    let response_json = serde_json::to_string(&response)
+        .map_err(|e| Error::Protocol(format!("Failed to serialize response: {}", e)))?;
+
+    debug!(
+        "ACTION.SUBMIT -> {} (created {} jobs)",
+        action_id,
+        job_ids.len()
+    );
+
+    Ok(RespValue::BulkString(response_json.into_bytes()))
 }
 
 #[cfg(test)]
