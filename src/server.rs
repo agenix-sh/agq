@@ -1109,45 +1109,52 @@ fn handle_hlen(args: &[RespValue], db: &Database) -> Result<RespValue> {
 /// Maximum plan JSON size (1MB)
 const MAX_PLAN_SIZE: usize = 1024 * 1024;
 
-/// Plan JSON schema for validation
+/// Plan JSON schema for validation (Layer 2 - Plan templates)
 ///
-/// Validates Plans according to EXECUTION-LAYERS.md nomenclature.
-/// A Plan contains an ordered list of Tasks (atomic execution units).
+/// Validates Plan definitions submitted via PLAN.SUBMIT.
+/// Plans are templates that are stored and later used to create Jobs.
+///
+/// **IMPORTANT**: This is the Plan schema (Layer 2), NOT the Job schema (Layer 3).
+/// - Plans do NOT have job_id (that's added when AGQ creates Jobs from Plans)
+/// - Plans have plan_id, description, and tasks
+/// - Jobs have job_id, plan_id, description, and tasks (see job-schema.md)
 ///
 /// # Security Constraints
-/// - Maximum 1000 tasks per plan (prevents resource exhaustion)
-/// - Maximum 256 characters for IDs and tool names
+/// - Maximum 100 tasks per plan (per canonical spec)
+/// - Maximum 256 characters for command names
 /// - Maximum 100 args per task
 /// - Maximum 65KB per arg (prevents memory exhaustion)
+/// - Minimum 1 task (non-empty plans only)
 const PLAN_SCHEMA: &str = r#"{
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "type": "object",
-  "required": ["version", "tasks"],
+  "required": ["plan_id", "tasks"],
   "properties": {
-    "version": {
+    "plan_id": {
       "type": "string",
-      "maxLength": 32
+      "minLength": 1,
+      "maxLength": 64
     },
-    "metadata": {
-      "type": "object",
-      "maxProperties": 100,
-      "additionalProperties": {
-        "maxLength": 65536
-      }
+    "plan_description": {
+      "type": "string",
+      "maxLength": 1024
     },
     "tasks": {
       "type": "array",
-      "maxItems": 1000,
+      "minItems": 1,
+      "maxItems": 100,
       "items": {
         "type": "object",
-        "required": ["id", "tool", "args"],
+        "required": ["task_number", "command"],
         "properties": {
-          "id": {
-            "type": "string",
-            "maxLength": 256
+          "task_number": {
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 100
           },
-          "tool": {
+          "command": {
             "type": "string",
+            "minLength": 1,
             "maxLength": 256
           },
           "args": {
@@ -1158,17 +1165,15 @@ const PLAN_SCHEMA: &str = r#"{
               "maxLength": 65536
             }
           },
-          "env": {
-            "type": "object",
-            "maxProperties": 100,
-            "additionalProperties": {
-              "type": "string",
-              "maxLength": 65536
-            }
+          "timeout_secs": {
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 3600
           },
-          "input": {
-            "type": "string",
-            "maxLength": 1048576
+          "input_from_task": {
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 100
           }
         }
       }
