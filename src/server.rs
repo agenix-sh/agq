@@ -1129,7 +1129,11 @@ const PLAN_SCHEMA: &str = r#"{
       "maxLength": 32
     },
     "metadata": {
-      "type": "object"
+      "type": "object",
+      "maxProperties": 100,
+      "additionalProperties": {
+        "maxLength": 65536
+      }
     },
     "tasks": {
       "type": "array",
