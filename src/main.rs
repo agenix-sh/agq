@@ -2,10 +2,11 @@
 //!
 //! Main entry point for the AGQ server.
 
-use agq::{Database, Result, Server};
+use agq::{start_plan_worker, Database, Result, Server};
 use clap::Parser;
 use ring::rand::{SecureRandom, SystemRandom};
 use std::path::PathBuf;
+use std::sync::Arc;
 use tracing::{error, info, warn};
 
 /// AGQ - Queue Manager for the AGX Agentic Ecosystem
@@ -75,6 +76,13 @@ async fn main() -> Result<()> {
     let db_path = data_dir.join("data.redb");
     info!("Initializing database at: {}", db_path.display());
     let db = Database::open(&db_path)?;
+    let db_arc = Arc::new(db);
+
+    // Start internal worker threads
+    let worker_db = Arc::clone(&db_arc);
+    tokio::spawn(async move {
+        start_plan_worker(worker_db).await;
+    });
 
     // Get or generate session key (CLI overrides env var)
     let session_key = if let Some(key_hex) = args.session_key {
@@ -97,7 +105,7 @@ async fn main() -> Result<()> {
     };
 
     // Create and run server
-    let server = Server::new(&bind_addr, session_key, db).await?;
+    let server = Server::new(&bind_addr, session_key, (*db_arc).clone()).await?;
     info!("AGQ server started successfully on {}", bind_addr);
 
     if let Err(e) = server.run().await {

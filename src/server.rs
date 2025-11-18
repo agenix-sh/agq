@@ -3,12 +3,14 @@
 use crate::error::{Error, Result};
 use crate::resp::{RespParser, RespValue};
 use crate::storage::{Database, HashOps, ListOps, SortedSetOps, StringOps};
+use crate::workers::InternalJob;
 use std::sync::Arc;
 use subtle::ConstantTimeEq;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::time::{timeout, Duration};
 use tracing::{debug, error, info, warn};
+use uuid::Uuid;
 
 /// Maximum number of concurrent connections
 const MAX_CONNECTIONS: usize = 1000;
@@ -320,6 +322,12 @@ async fn handle_command(
                 return Err(Error::NoAuth);
             }
             handle_hlen(&args, db)
+        }
+        "PLAN.SUBMIT" => {
+            if !*authenticated {
+                return Err(Error::NoAuth);
+            }
+            handle_plan_submit(&args, db)
         }
         _ => {
             if !*authenticated {
@@ -1092,6 +1100,124 @@ fn handle_hlen(args: &[RespValue], db: &Database) -> Result<RespValue> {
     let key = args[1].as_string()?;
     let count = db.hlen(&key)?;
     Ok(RespValue::Integer(count as i64))
+}
+
+/// Maximum plan JSON size (1MB)
+const MAX_PLAN_SIZE: usize = 1024 * 1024;
+
+/// Plan JSON schema for validation
+const PLAN_SCHEMA: &str = r#"{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "type": "object",
+  "required": ["version", "steps"],
+  "properties": {
+    "version": {
+      "type": "string"
+    },
+    "metadata": {
+      "type": "object"
+    },
+    "steps": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["id", "tool", "args"],
+        "properties": {
+          "id": { "type": "string" },
+          "tool": { "type": "string" },
+          "args": {
+            "type": "array",
+            "items": { "type": "string" }
+          },
+          "env": {
+            "type": "object",
+            "additionalProperties": { "type": "string" }
+          },
+          "input": { "type": "string" }
+        }
+      }
+    }
+  }
+}"#;
+
+/// Handle PLAN.SUBMIT command
+///
+/// Syntax: PLAN.SUBMIT <plan_json>
+/// Returns: plan_id (unique identifier for the submitted plan)
+///
+/// # Security
+/// - Validates JSON schema against Plan specification
+/// - Enforces maximum plan size (1MB)
+/// - Generates cryptographically secure plan IDs
+///
+/// # Implementation
+/// This follows the internal queue worker pattern:
+/// 1. Validate input
+/// 2. Generate plan_id
+/// 3. Push to internal queue (agq:internal:plan.submit)
+/// 4. Return plan_id immediately (async processing)
+fn handle_plan_submit(args: &[RespValue], db: &Database) -> Result<RespValue> {
+    // Validate arguments
+    if args.len() != 2 {
+        return Err(Error::InvalidArguments(
+            "PLAN.SUBMIT requires exactly one argument (plan JSON)".to_string(),
+        ));
+    }
+
+    let plan_json = args[1].as_string()?;
+
+    // Security: Enforce size limits to prevent resource exhaustion
+    if plan_json.len() > MAX_PLAN_SIZE {
+        return Err(Error::InvalidArguments(format!(
+            "Plan JSON too large (max {} bytes)",
+            MAX_PLAN_SIZE
+        )));
+    }
+
+    // Validate JSON is well-formed
+    let plan_value: serde_json::Value = serde_json::from_str(&plan_json)
+        .map_err(|e| Error::InvalidArguments(format!("Invalid JSON: {}", e)))?;
+
+    // Validate against Plan schema
+    let schema: serde_json::Value = serde_json::from_str(PLAN_SCHEMA)
+        .map_err(|e| Error::Protocol(format!("Internal schema error: {}", e)))?;
+
+    let validator = jsonschema::JSONSchema::compile(&schema)
+        .map_err(|e| Error::Protocol(format!("Schema validation setup error: {}", e)))?;
+
+    if let Err(errors) = validator.validate(&plan_value) {
+        let error_msgs: Vec<String> = errors.map(|e| format!("{}", e)).collect();
+        return Err(Error::InvalidArguments(format!(
+            "Plan validation failed: {}",
+            error_msgs.join(", ")
+        )));
+    }
+
+    // Generate unique plan ID
+    let plan_id = format!("plan_{}", Uuid::new_v4().simple());
+
+    // Create internal job
+    let internal_job = InternalJob {
+        id: Uuid::new_v4().to_string(),
+        operation: "plan.submit".to_string(),
+        entity_id: plan_id.clone(),
+        payload: plan_json.to_string(),
+        timestamp: get_current_timestamp_secs()?,
+        retry_count: 0,
+        max_retries: 3,
+    };
+
+    // Serialize job to JSON
+    let job_json = serde_json::to_vec(&internal_job)
+        .map_err(|e| Error::Protocol(format!("Failed to serialize internal job: {}", e)))?;
+
+    // Push to internal queue
+    db.lpush("agq:internal:plan.submit", &job_json)?;
+
+    debug!("PLAN.SUBMIT -> {} (queued for processing)", plan_id);
+
+    // Return plan_id immediately (processing continues asynchronously)
+    Ok(RespValue::BulkString(plan_id.into_bytes()))
 }
 
 #[cfg(test)]

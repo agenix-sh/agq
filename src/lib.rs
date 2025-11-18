@@ -7,7 +7,9 @@ pub mod error;
 pub mod resp;
 pub mod server;
 pub mod storage;
+pub mod workers;
 
 pub use error::{Error, Result};
 pub use server::Server;
 pub use storage::Database;
+pub use workers::start_plan_worker;
