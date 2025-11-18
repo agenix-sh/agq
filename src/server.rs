@@ -243,6 +243,12 @@ async fn handle_command(
             }
             handle_lrange(&args, db)
         }
+        "LREM" => {
+            if !*authenticated {
+                return Err(Error::NoAuth);
+            }
+            handle_lrem(&args, db)
+        }
         "RPOPLPUSH" => {
             if !*authenticated {
                 return Err(Error::NoAuth);
@@ -773,6 +779,44 @@ fn handle_lrange(args: &[RespValue], db: &Database) -> Result<RespValue> {
     let resp_elements: Vec<RespValue> = elements.into_iter().map(RespValue::BulkString).collect();
 
     Ok(RespValue::Array(resp_elements))
+}
+
+/// Handle LREM command
+///
+/// Syntax: LREM key count element
+/// Returns: Integer - number of removed elements
+///
+/// Removes the first `count` occurrences of `element` from list `key`:
+/// - If count > 0: Remove elements from head to tail
+/// - If count < 0: Remove elements from tail to head
+/// - If count = 0: Remove all occurrences
+fn handle_lrem(args: &[RespValue], db: &Database) -> Result<RespValue> {
+    if args.len() != 4 {
+        return Err(Error::InvalidArguments(
+            "LREM requires exactly three arguments: key count element".to_string(),
+        ));
+    }
+
+    let key = args[1].as_string()?;
+    let count_str = args[2].as_string()?;
+
+    // Extract element as bytes (BulkString)
+    let element = match &args[3] {
+        RespValue::BulkString(data) => data,
+        _ => {
+            return Err(Error::InvalidArguments(
+                "LREM element must be a bulk string".to_string(),
+            ))
+        }
+    };
+
+    let count: i64 = count_str
+        .parse()
+        .map_err(|_| Error::InvalidArguments("LREM count must be an integer".to_string()))?;
+
+    let removed = db.lrem(&key, count, element)?;
+
+    Ok(RespValue::Integer(removed))
 }
 
 /// Handle RPOPLPUSH command
