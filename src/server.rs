@@ -333,6 +333,12 @@ async fn handle_command(
             }
             handle_plan_submit(&args, db)
         }
+        "ACTION.SUBMIT" => {
+            if !*authenticated {
+                return Err(Error::NoAuth);
+            }
+            handle_action_submit(&args, db)
+        }
         _ => {
             if !*authenticated {
                 return Err(Error::NoAuth);
@@ -1287,6 +1293,260 @@ fn handle_plan_submit(args: &[RespValue], db: &Database) -> Result<RespValue> {
 
     // Return plan_id immediately (processing continues asynchronously)
     Ok(RespValue::BulkString(plan_id.into_bytes()))
+}
+
+/// Validate an identifier (plan_id, action_id, job_id, etc.)
+///
+/// # Security
+/// Identifiers must be:
+/// - 1-64 characters long
+/// - Alphanumeric with hyphens, underscores only
+/// - No special characters (prevents injection attacks)
+///
+/// # Arguments
+/// * `id` - The identifier to validate
+/// * `field_name` - Name of the field for error messages
+///
+/// # Returns
+/// Ok(()) if valid, Err with detailed message if invalid
+fn validate_identifier(id: &str, field_name: &str) -> Result<()> {
+    // Check length
+    if id.is_empty() || id.len() > 64 {
+        return Err(Error::InvalidArguments(format!(
+            "{} must be between 1 and 64 characters",
+            field_name
+        )));
+    }
+
+    // Check characters (alphanumeric + hyphen + underscore only)
+    if !id
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+    {
+        return Err(Error::InvalidArguments(format!(
+            "{} contains invalid characters (only alphanumeric, hyphens, and underscores allowed)",
+            field_name
+        )));
+    }
+
+    Ok(())
+}
+
+/// Maximum size for a single input in ACTION.SUBMIT (10MB)
+///
+/// Prevents resource exhaustion attacks where large inputs bypass
+/// the 100-input limit (100 * 10MB = 1GB max per Action)
+const MAX_INPUT_SIZE: usize = 10 * 1024 * 1024; // 10MB
+
+/// Rate limiter for ACTION.SUBMIT commands (dedicated)
+///
+/// Separate from PLAN_SUBMIT to prevent DoS attacks that target
+/// the more expensive ACTION.SUBMIT operation (creates multiple Jobs)
+///
+/// # Rate Limit
+/// - 100 actions/minute globally (~1.67 actions/second)
+/// - Lower than PLAN_SUBMIT due to higher cost
+static ACTION_SUBMIT_LIMITER: Lazy<
+    governor::RateLimiter<
+        governor::state::direct::NotKeyed,
+        governor::state::InMemoryState,
+        governor::clock::DefaultClock,
+    >,
+> = Lazy::new(|| governor::RateLimiter::direct(Quota::per_minute(NonZeroU32::new(100).unwrap())));
+
+/// Handle ACTION.SUBMIT command (Layer 4 - Action execution)
+///
+/// Syntax: ACTION.SUBMIT <action_json>
+/// Returns: JSON response with action_id and created job_ids
+///
+/// # Action JSON Format
+/// ```json
+/// {
+///   "action_id": "action-uuid",
+///   "plan_id": "plan-uuid",
+///   "inputs": [
+///     {"file": "/path/to/file1.txt"},
+///     {"file": "/path/to/file2.txt"}
+///   ]
+/// }
+/// ```
+///
+/// # Implementation
+/// 1. Validate action JSON structure
+/// 2. Verify plan_id exists in database
+/// 3. Create N Jobs (one per input in inputs array)
+/// 4. Each Job = Plan template + job_id + specific input data
+/// 5. Enqueue Jobs to queue:ready for worker dispatch
+/// 6. Return action summary
+///
+/// # Security
+/// - Validates JSON structure
+/// - Validates identifiers (prevents injection attacks)
+/// - Checks for duplicate action_id (prevents overwrites)
+/// - Verifies Plan exists before creating Jobs
+/// - Enforces maximum inputs limit (100 per Action)
+/// - Enforces per-input size limits (10MB per input)
+/// - Dedicated rate limiter (100/minute)
+fn handle_action_submit(args: &[RespValue], db: &Database) -> Result<RespValue> {
+    // Security: Check rate limit (dedicated ACTION_SUBMIT limiter)
+    if ACTION_SUBMIT_LIMITER.check().is_err() {
+        warn!("ACTION.SUBMIT rate limit exceeded");
+        return Err(Error::Protocol(
+            "Rate limit exceeded for ACTION.SUBMIT (max 100/minute)".to_string(),
+        ));
+    }
+
+    // Validate arguments
+    if args.len() != 2 {
+        return Err(Error::InvalidArguments(
+            "ACTION.SUBMIT requires exactly one argument (action JSON)".to_string(),
+        ));
+    }
+
+    let action_json = args[1].as_string()?;
+
+    // Parse action JSON
+    let action_value: serde_json::Value = serde_json::from_str(&action_json)
+        .map_err(|e| Error::InvalidArguments(format!("Invalid JSON: {}", e)))?;
+
+    // Extract required fields
+    let action_id = action_value["action_id"]
+        .as_str()
+        .ok_or_else(|| Error::InvalidArguments("Missing required field: action_id".to_string()))?;
+
+    let plan_id = action_value["plan_id"]
+        .as_str()
+        .ok_or_else(|| Error::InvalidArguments("Missing required field: plan_id".to_string()))?;
+
+    // Security: Validate identifiers to prevent injection attacks
+    validate_identifier(action_id, "action_id")?;
+    validate_identifier(plan_id, "plan_id")?;
+
+    let inputs = action_value["inputs"].as_array().ok_or_else(|| {
+        Error::InvalidArguments("Missing or invalid field: inputs (must be array)".to_string())
+    })?;
+
+    // Security: Enforce maximum inputs limit
+    if inputs.is_empty() {
+        return Err(Error::InvalidArguments(
+            "inputs array must contain at least one input".to_string(),
+        ));
+    }
+
+    if inputs.len() > 100 {
+        return Err(Error::InvalidArguments(
+            "inputs array exceeds maximum of 100 inputs per Action".to_string(),
+        ));
+    }
+
+    // Security: Validate per-input size to prevent resource exhaustion
+    for (idx, input) in inputs.iter().enumerate() {
+        let input_str = serde_json::to_string(input)
+            .map_err(|e| Error::Protocol(format!("Failed to serialize input {}: {}", idx, e)))?;
+
+        if input_str.len() > MAX_INPUT_SIZE {
+            return Err(Error::InvalidArguments(format!(
+                "Input {} exceeds maximum size of {} bytes (got {} bytes)",
+                idx,
+                MAX_INPUT_SIZE,
+                input_str.len()
+            )));
+        }
+    }
+
+    // Verify Plan exists and retrieve JSON (single operation to avoid TOCTOU)
+    let plan_key = format!("plan:{}", plan_id);
+    let plan_json_bytes = db
+        .hget(&plan_key, "json")?
+        .ok_or_else(|| Error::InvalidArguments(format!("Plan not found: {}", plan_id)))?;
+
+    // Security: Check for duplicate action_id to prevent overwrites
+    // (done after plan existence check to avoid leaking info about action_ids)
+    let action_key = format!("action:{}", action_id);
+    let action_exists = db.hget(&action_key, "status")?.is_some();
+    if action_exists {
+        return Err(Error::InvalidArguments(format!(
+            "Action ID already exists: {}",
+            action_id
+        )));
+    }
+
+    let plan_json = std::str::from_utf8(&plan_json_bytes)
+        .map_err(|e| Error::Protocol(format!("Plan JSON is not valid UTF-8: {}", e)))?;
+
+    let plan_value: serde_json::Value = serde_json::from_str(plan_json)
+        .map_err(|e| Error::Protocol(format!("Plan JSON is invalid: {}", e)))?;
+
+    // Create Jobs (one per input)
+    let mut job_ids = Vec::new();
+
+    for (idx, input) in inputs.iter().enumerate() {
+        // Security: Safe conversion for input_index (already bounded by 100 input limit)
+        let input_index =
+            u64::try_from(idx).map_err(|_| Error::Protocol("Input index overflow".to_string()))?;
+
+        // Generate unique job_id
+        let job_id = format!("job_{}", Uuid::new_v4().simple());
+
+        // Create Job = Plan + job_id + input
+        // Per Layer 2→3 transition: Plans don't have job_id, Jobs do
+        let mut job_value = plan_value.clone();
+        job_value["job_id"] = serde_json::Value::String(job_id.clone());
+        job_value["input"] = input.clone();
+        job_value["input_index"] = serde_json::Value::Number(input_index.into());
+
+        // Serialize Job to JSON
+        let job_json = serde_json::to_string(&job_value)
+            .map_err(|e| Error::Protocol(format!("Failed to serialize Job: {}", e)))?;
+
+        // Enqueue Job to queue:ready
+        db.lpush("queue:ready", job_json.as_bytes())?;
+
+        // Store Job metadata in hash
+        let job_key = format!("job:{}", job_id);
+        db.hset(&job_key, "action_id", action_id.as_bytes())?;
+        db.hset(&job_key, "plan_id", plan_id.as_bytes())?;
+        db.hset(&job_key, "status", b"pending")?;
+        let timestamp = get_current_timestamp_secs()?;
+        db.hset(&job_key, "created_at", timestamp.to_string().as_bytes())?;
+
+        // Index Job by action_id (for querying jobs by action)
+        let action_jobs_key = format!("action:{}:jobs", action_id);
+        db.lpush(&action_jobs_key, job_id.as_bytes())?;
+
+        job_ids.push(job_id);
+    }
+
+    // Store Action metadata
+    let action_key = format!("action:{}", action_id);
+    db.hset(&action_key, "plan_id", plan_id.as_bytes())?;
+    db.hset(
+        &action_key,
+        "jobs_created",
+        job_ids.len().to_string().as_bytes(),
+    )?;
+    db.hset(&action_key, "status", b"running")?;
+    let timestamp = get_current_timestamp_secs()?;
+    db.hset(&action_key, "created_at", timestamp.to_string().as_bytes())?;
+
+    // Build response JSON
+    let response = serde_json::json!({
+        "action_id": action_id,
+        "plan_id": plan_id,
+        "jobs_created": job_ids.len(),
+        "job_ids": job_ids
+    });
+
+    let response_json = serde_json::to_string(&response)
+        .map_err(|e| Error::Protocol(format!("Failed to serialize response: {}", e)))?;
+
+    debug!(
+        "ACTION.SUBMIT -> {} (created {} jobs)",
+        action_id,
+        job_ids.len()
+    );
+
+    Ok(RespValue::BulkString(response_json.into_bytes()))
 }
 
 #[cfg(test)]
