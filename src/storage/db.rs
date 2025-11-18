@@ -55,8 +55,9 @@ const MAX_FIELD_VALUE_SIZE: usize = 10_485_760; // 10MB
 ///
 /// Provides ACID-compliant embedded storage using redb.
 /// All operations are thread-safe and support concurrent reads.
+#[derive(Clone)]
 pub struct Database {
-    db: RedbDatabase,
+    db: Arc<RedbDatabase>,
     /// Notifications for list changes (used by BRPOP)
     /// Key format: list key name
     /// Uses std::sync::Mutex because we need to access it from both sync (LPUSH) and async (BRPOP) contexts
@@ -123,7 +124,7 @@ impl Database {
         info!("Database initialized successfully");
 
         Ok(Self {
-            db,
+            db: Arc::new(db),
             list_notifiers: Arc::new(std::sync::Mutex::new(HashMap::new())),
         })
     }
