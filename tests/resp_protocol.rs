@@ -1504,6 +1504,172 @@ async fn test_brpoplpush_invalid_timeout() {
 }
 
 // ============================================================================
+// LREM Tests (List Remove)
+// ============================================================================
+
+#[tokio::test]
+async fn test_lrem_removes_elements() {
+    let (_handle, port) = start_test_server().await;
+    let mut stream = TcpStream::connect(format!("127.0.0.1:{port}"))
+        .await
+        .expect("Failed to connect");
+
+    // Authenticate
+    let auth_cmd = b"*2\r\n$4\r\nAUTH\r\n$32\r\ntest_session_key_32_bytes_long!!\r\n";
+    send_resp_command(&mut stream, auth_cmd).await;
+
+    // Setup list: [a, b, a, c, a]
+    let lpush_cmd = b"*3\r\n$5\r\nLPUSH\r\n$4\r\nlist\r\n$1\r\na\r\n";
+    send_resp_command(&mut stream, lpush_cmd).await;
+    let lpush_cmd = b"*3\r\n$5\r\nLPUSH\r\n$4\r\nlist\r\n$1\r\nc\r\n";
+    send_resp_command(&mut stream, lpush_cmd).await;
+    let lpush_cmd = b"*3\r\n$5\r\nLPUSH\r\n$4\r\nlist\r\n$1\r\na\r\n";
+    send_resp_command(&mut stream, lpush_cmd).await;
+    let lpush_cmd = b"*3\r\n$5\r\nLPUSH\r\n$4\r\nlist\r\n$1\r\nb\r\n";
+    send_resp_command(&mut stream, lpush_cmd).await;
+    let lpush_cmd = b"*3\r\n$5\r\nLPUSH\r\n$4\r\nlist\r\n$1\r\na\r\n";
+    send_resp_command(&mut stream, lpush_cmd).await;
+
+    // LREM list 2 "a" - remove first 2 occurrences
+    let lrem_cmd = b"*4\r\n$4\r\nLREM\r\n$4\r\nlist\r\n$1\r\n2\r\n$1\r\na\r\n";
+    let response = send_resp_command(&mut stream, lrem_cmd).await;
+    assert_eq!(&response, b":2\r\n", "LREM should return 2");
+
+    // Verify remaining elements with LRANGE
+    let lrange_cmd = b"*4\r\n$6\r\nLRANGE\r\n$4\r\nlist\r\n$1\r\n0\r\n$2\r\n-1\r\n";
+    let response = send_resp_command(&mut stream, lrange_cmd).await;
+    // Should be: [b, a, c]
+    assert!(response.starts_with(b"*3\r\n"), "Should have 3 elements");
+}
+
+#[tokio::test]
+async fn test_lrem_removes_all_occurrences() {
+    let (_handle, port) = start_test_server().await;
+    let mut stream = TcpStream::connect(format!("127.0.0.1:{port}"))
+        .await
+        .expect("Failed to connect");
+
+    // Authenticate
+    let auth_cmd = b"*2\r\n$4\r\nAUTH\r\n$32\r\ntest_session_key_32_bytes_long!!\r\n";
+    send_resp_command(&mut stream, auth_cmd).await;
+
+    // Setup list: [a, b, a, c]
+    let lpush_cmd = b"*3\r\n$5\r\nLPUSH\r\n$4\r\nlist\r\n$1\r\nc\r\n";
+    send_resp_command(&mut stream, lpush_cmd).await;
+    let lpush_cmd = b"*3\r\n$5\r\nLPUSH\r\n$4\r\nlist\r\n$1\r\na\r\n";
+    send_resp_command(&mut stream, lpush_cmd).await;
+    let lpush_cmd = b"*3\r\n$5\r\nLPUSH\r\n$4\r\nlist\r\n$1\r\nb\r\n";
+    send_resp_command(&mut stream, lpush_cmd).await;
+    let lpush_cmd = b"*3\r\n$5\r\nLPUSH\r\n$4\r\nlist\r\n$1\r\na\r\n";
+    send_resp_command(&mut stream, lpush_cmd).await;
+
+    // LREM list 0 "a" - remove all occurrences
+    let lrem_cmd = b"*4\r\n$4\r\nLREM\r\n$4\r\nlist\r\n$1\r\n0\r\n$1\r\na\r\n";
+    let response = send_resp_command(&mut stream, lrem_cmd).await;
+    assert_eq!(&response, b":2\r\n", "LREM should return 2");
+
+    // LLEN should return 2
+    let llen_cmd = b"*2\r\n$4\r\nLLEN\r\n$4\r\nlist\r\n";
+    let response = send_resp_command(&mut stream, llen_cmd).await;
+    assert_eq!(&response, b":2\r\n", "List should have 2 elements");
+}
+
+#[tokio::test]
+async fn test_lrem_nonexistent_key() {
+    let (_handle, port) = start_test_server().await;
+    let mut stream = TcpStream::connect(format!("127.0.0.1:{port}"))
+        .await
+        .expect("Failed to connect");
+
+    // Authenticate
+    let auth_cmd = b"*2\r\n$4\r\nAUTH\r\n$32\r\ntest_session_key_32_bytes_long!!\r\n";
+    send_resp_command(&mut stream, auth_cmd).await;
+
+    // LREM on non-existent key should return 0
+    let lrem_cmd = b"*4\r\n$4\r\nLREM\r\n$11\r\nnonexistent\r\n$1\r\n1\r\n$1\r\na\r\n";
+    let response = send_resp_command(&mut stream, lrem_cmd).await;
+    assert_eq!(&response, b":0\r\n", "LREM on nonexistent key should return 0");
+}
+
+#[tokio::test]
+async fn test_lrem_invalid_args() {
+    let (_handle, port) = start_test_server().await;
+    let mut stream = TcpStream::connect(format!("127.0.0.1:{port}"))
+        .await
+        .expect("Failed to connect");
+
+    // Authenticate
+    let auth_cmd = b"*2\r\n$4\r\nAUTH\r\n$32\r\ntest_session_key_32_bytes_long!!\r\n";
+    send_resp_command(&mut stream, auth_cmd).await;
+
+    // LREM with only 2 arguments (should fail)
+    let lrem_cmd = b"*3\r\n$4\r\nLREM\r\n$4\r\nlist\r\n$1\r\n1\r\n";
+    let response = send_resp_command(&mut stream, lrem_cmd).await;
+    assert!(response.starts_with(b"-ERR"), "LREM with wrong args should error");
+}
+
+#[tokio::test]
+async fn test_lrem_invalid_count() {
+    let (_handle, port) = start_test_server().await;
+    let mut stream = TcpStream::connect(format!("127.0.0.1:{port}"))
+        .await
+        .expect("Failed to connect");
+
+    // Authenticate
+    let auth_cmd = b"*2\r\n$4\r\nAUTH\r\n$32\r\ntest_session_key_32_bytes_long!!\r\n";
+    send_resp_command(&mut stream, auth_cmd).await;
+
+    // LREM with non-integer count
+    let lrem_cmd = b"*4\r\n$4\r\nLREM\r\n$4\r\nlist\r\n$3\r\nabc\r\n$1\r\na\r\n";
+    let response = send_resp_command(&mut stream, lrem_cmd).await;
+    assert!(response.starts_with(b"-ERR"), "LREM with invalid count should error");
+}
+
+#[tokio::test]
+async fn test_lrem_requires_auth() {
+    let (_handle, port) = start_test_server().await;
+    let mut stream = TcpStream::connect(format!("127.0.0.1:{port}"))
+        .await
+        .expect("Failed to connect");
+
+    // Try LREM without authenticating
+    let lrem_cmd = b"*4\r\n$4\r\nLREM\r\n$4\r\nlist\r\n$1\r\n1\r\n$1\r\na\r\n";
+    let response = send_resp_command(&mut stream, lrem_cmd).await;
+    assert!(response.starts_with(b"-"), "LREM without auth should error");
+    let error_msg = std::str::from_utf8(&response).unwrap();
+    assert!(error_msg.contains("NOAUTH"), "Should require authentication");
+}
+
+#[tokio::test]
+async fn test_lrem_queue_cleanup_pattern() {
+    let (_handle, port) = start_test_server().await;
+    let mut stream = TcpStream::connect(format!("127.0.0.1:{port}"))
+        .await
+        .expect("Failed to connect");
+
+    // Authenticate
+    let auth_cmd = b"*2\r\n$4\r\nAUTH\r\n$32\r\ntest_session_key_32_bytes_long!!\r\n";
+    send_resp_command(&mut stream, auth_cmd).await;
+
+    // Simulate AGW job queue cleanup
+    // 1. Add jobs to processing queue
+    let lpush_cmd = b"*3\r\n$5\r\nLPUSH\r\n$16\r\nqueue:processing\r\n$7\r\njob_456\r\n";
+    send_resp_command(&mut stream, lpush_cmd).await;
+    let lpush_cmd = b"*3\r\n$5\r\nLPUSH\r\n$16\r\nqueue:processing\r\n$7\r\njob_123\r\n";
+    send_resp_command(&mut stream, lpush_cmd).await;
+
+    // 2. Job completes - remove from processing queue
+    let lrem_cmd = b"*4\r\n$4\r\nLREM\r\n$16\r\nqueue:processing\r\n$1\r\n1\r\n$7\r\njob_123\r\n";
+    let response = send_resp_command(&mut stream, lrem_cmd).await;
+    assert_eq!(&response, b":1\r\n", "Should remove 1 job");
+
+    // 3. Verify only job_456 remains
+    let llen_cmd = b"*2\r\n$4\r\nLLEN\r\n$16\r\nqueue:processing\r\n";
+    let response = send_resp_command(&mut stream, llen_cmd).await;
+    assert_eq!(&response, b":1\r\n", "Should have 1 job remaining");
+}
+
+// ============================================================================
 // Key Expiry Tests (SET EX, TTL)
 // ============================================================================
 

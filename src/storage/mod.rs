@@ -150,6 +150,48 @@ pub trait ListOps {
         destination: &str,
         timeout_secs: u64,
     ) -> Result<Option<Vec<u8>>>;
+
+    /// Remove elements from a list
+    ///
+    /// # Arguments
+    /// * `key` - The list key
+    /// * `count` - Number of occurrences to remove:
+    ///   - `count > 0`: Remove elements from head to tail
+    ///   - `count < 0`: Remove elements from tail to head
+    ///   - `count = 0`: Remove all occurrences
+    /// * `element` - The value to remove
+    ///
+    /// # Returns
+    /// The number of removed elements
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the database operation fails or if input validation fails.
+    ///
+    /// # Performance
+    /// - Time complexity: O(N) where N is the list length
+    /// - Space complexity: O(N) due to list compaction
+    /// - After removal, the list is compacted to maintain contiguous indices
+    ///
+    /// # Note
+    /// This operation requires reading the entire list into memory for compaction.
+    /// For very large lists, consider the performance implications.
+    ///
+    /// # Examples
+    /// ```no_run
+    /// # use agq::storage::{Database, ListOps};
+    /// # let db = Database::open("test.redb").unwrap();
+    /// // Remove first 2 occurrences of "value" from head
+    /// db.lrem("mylist", 2, b"value")?;
+    ///
+    /// // Remove last occurrence of "value" from tail
+    /// db.lrem("mylist", -1, b"value")?;
+    ///
+    /// // Remove all occurrences of "value"
+    /// db.lrem("mylist", 0, b"value")?;
+    /// # Ok::<(), agq::error::Error>(())
+    /// ```
+    fn lrem(&self, key: &str, count: i64, element: &[u8]) -> Result<i64>;
 }
 
 /// Storage operations for sorted set data
