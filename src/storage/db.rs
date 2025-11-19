@@ -1097,9 +1097,9 @@ impl ListOps for Database {
                     }
                 }
 
-            // Determine which elements to remove and collect remaining elements in a single pass
-            let mut removed_count = 0i64;
-            let indices_to_remove: std::collections::HashSet<i64>;
+                // Determine which elements to remove and collect remaining elements in a single pass
+                let mut removed_count = 0i64;
+                let indices_to_remove: std::collections::HashSet<i64>;
 
                 if count == 0 {
                     // Remove all occurrences
