@@ -1546,9 +1546,14 @@ impl HashOps for Database {
             let hash_key = format!("{}:{}", key, field);
 
             // Get current value (default to 0 if not exists)
-            let current_value: i64 = table
+            let existing_value = table
                 .get(hash_key.as_str())
-                .map_err(|e| Error::Protocol(format!("Failed to read hash field: {e}")))?
+                .map_err(|e| Error::Protocol(format!("Failed to read hash field: {e}")))?;
+
+            let is_new_field = existing_value.is_none();
+
+            let current_value: i64 = existing_value
+                .as_ref()
                 .map(|v| {
                     let bytes = v.value();
                     std::str::from_utf8(bytes)
@@ -1560,6 +1565,40 @@ impl HashOps for Database {
                 })
                 .transpose()?
                 .unwrap_or(0);
+
+            // Drop existing_value to release borrow before doing range query
+            drop(existing_value);
+
+            // If field doesn't exist, check field count limit before creating
+            if is_new_field {
+                let prefix = format!("{}:", key);
+                let mut count: u64 = 0;
+
+                for item in table
+                    .range(prefix.as_str()..)
+                    .map_err(|e| Error::Protocol(format!("Failed to count fields: {e}")))?
+                {
+                    let (k, _) = item.map_err(|e| Error::Protocol(format!("Failed to read field: {e}")))?;
+                    let key_str = k.value();
+
+                    // Stop counting if we've moved past this hash's fields
+                    if !key_str.starts_with(&prefix) {
+                        break;
+                    }
+
+                    count = count
+                        .checked_add(1)
+                        .ok_or_else(|| Error::Protocol("Field count overflow".to_string()))?;
+                }
+
+                // Check if adding this field would exceed the limit
+                if count >= MAX_HASH_FIELDS {
+                    return Err(Error::Protocol(format!(
+                        "Hash field limit exceeded: {} (max: {})",
+                        count, MAX_HASH_FIELDS
+                    )));
+                }
+            }
 
             // Calculate new value with overflow check
             let new_value = current_value

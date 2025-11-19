@@ -1139,6 +1139,33 @@ fn handle_hincrby(args: &[RespValue], db: &Database) -> Result<RespValue> {
     let field = args[2].as_string()?;
     let increment_str = args[3].as_string()?;
 
+    // Validate key length (allow more liberal characters for namespacing like "stats:plan_id")
+    if key.is_empty() || key.len() > 256 {
+        return Err(Error::InvalidArguments(
+            "HINCRBY key must be between 1 and 256 characters".to_string(),
+        ));
+    }
+
+    // Validate field length and characters
+    if field.is_empty() || field.len() > 256 {
+        return Err(Error::InvalidArguments(
+            "HINCRBY field must be between 1 and 256 characters".to_string(),
+        ));
+    }
+
+    // Only allow printable ASCII characters (no control characters)
+    if !key.chars().all(|c| c.is_ascii() && !c.is_ascii_control()) {
+        return Err(Error::InvalidArguments(
+            "HINCRBY key contains invalid characters".to_string(),
+        ));
+    }
+
+    if !field.chars().all(|c| c.is_ascii() && !c.is_ascii_control()) {
+        return Err(Error::InvalidArguments(
+            "HINCRBY field contains invalid characters".to_string(),
+        ));
+    }
+
     let increment: i64 = increment_str.parse().map_err(|_| {
         Error::InvalidArguments("HINCRBY increment must be an integer".to_string())
     })?;
@@ -1573,7 +1600,7 @@ fn handle_action_submit(args: &[RespValue], db: &Database) -> Result<RespValue> 
     });
 
     let response_json = serde_json::to_string(&response)
-        .map_err(|e| Error::Protocol(format!("Failed to serialize response: {}", e)))?;
+        .map_err(|_| Error::Protocol("Failed to serialize response".to_string()))?;
 
     debug!(
         "ACTION.SUBMIT -> {} (created {} jobs)",
@@ -1616,7 +1643,10 @@ fn handle_plans_list(args: &[RespValue], db: &Database) -> Result<RespValue> {
     }
 
     // Get paginated plan IDs from the plans:all sorted set (sorted by creation time)
-    let stop = offset + limit - 1;
+    // Use checked arithmetic to prevent integer overflow
+    let stop = offset.checked_add(limit)
+        .and_then(|sum| sum.checked_sub(1))
+        .ok_or_else(|| Error::InvalidArguments("Pagination range overflow".to_string()))?;
     let plan_entries = db.zrange("plans:all", offset, stop)?;
 
     let mut plans = Vec::new();
@@ -1627,27 +1657,23 @@ fn handle_plans_list(args: &[RespValue], db: &Database) -> Result<RespValue> {
 
         let plan_key = format!("plan:{}", plan_id);
 
-        // Get plan metadata
-        let json_bytes = match db.hget(&plan_key, "json")? {
-            Some(bytes) => bytes,
-            None => continue, // Plan was deleted, skip
-        };
+        // Check if plan still exists (may have been deleted)
+        if !db.hexists(&plan_key, "json")? {
+            continue;
+        }
 
-        let json_str = std::str::from_utf8(&json_bytes)
-            .map_err(|_| Error::Protocol("Invalid plan JSON encoding".to_string()))?;
-
-        let plan_value: serde_json::Value = serde_json::from_str(json_str)
-            .map_err(|_| Error::Protocol("Invalid plan JSON format".to_string()))?;
-
-        // Get task count
-        let task_count = plan_value["tasks"]
-            .as_array()
-            .map(|tasks| tasks.len())
+        // Get task_count from stored metadata (no JSON parsing needed)
+        let task_count_bytes = db.hget(&plan_key, "task_count")?
+            .unwrap_or_else(|| b"0".to_vec());
+        let task_count = std::str::from_utf8(&task_count_bytes)
+            .ok()
+            .and_then(|s| s.parse::<u64>().ok())
             .unwrap_or(0);
 
-        // Get description
-        let description = plan_value["plan_description"]
-            .as_str()
+        // Get description from stored metadata
+        let description_bytes = db.hget(&plan_key, "plan_description")?
+            .unwrap_or_default();
+        let description = std::str::from_utf8(&description_bytes)
             .unwrap_or("");
 
         // Get creation timestamp
@@ -1672,7 +1698,7 @@ fn handle_plans_list(args: &[RespValue], db: &Database) -> Result<RespValue> {
     }
 
     let response = serde_json::to_string(&plans)
-        .map_err(|e| Error::Protocol(format!("Failed to serialize response: {}", e)))?;
+        .map_err(|_| Error::Protocol("Failed to serialize response".to_string()))?;
 
     debug!("PLAN.LIST -> {} plans", plans.len());
     Ok(RespValue::BulkString(response.into_bytes()))
@@ -1717,7 +1743,7 @@ fn handle_plans_get(args: &[RespValue], db: &Database) -> Result<RespValue> {
     }
 
     let response = serde_json::to_string(&plan_value)
-        .map_err(|e| Error::Protocol(format!("Failed to serialize response: {}", e)))?;
+        .map_err(|_| Error::Protocol("Failed to serialize response".to_string()))?;
 
     debug!("PLAN.GET {} -> {} bytes", plan_id, response.len());
     Ok(RespValue::BulkString(response.into_bytes()))
@@ -1734,7 +1760,7 @@ fn handle_actions_list(_args: &[RespValue], _db: &Database) -> Result<RespValue>
     let actions: Vec<serde_json::Value> = Vec::new();
 
     let response = serde_json::to_string(&actions)
-        .map_err(|e| Error::Protocol(format!("Failed to serialize response: {}", e)))?;
+        .map_err(|_| Error::Protocol("Failed to serialize response".to_string()))?;
 
     debug!("ACTION.LIST -> {} actions", actions.len());
     Ok(RespValue::BulkString(response.into_bytes()))
@@ -1813,8 +1839,11 @@ fn handle_actions_get(args: &[RespValue], db: &Database) -> Result<RespValue> {
     };
 
     // Get paginated job list
+    // Use checked arithmetic to prevent integer overflow
     let action_jobs_key = format!("action:{}:jobs", action_id);
-    let job_stop = job_offset + job_limit - 1;
+    let job_stop = job_offset.checked_add(job_limit)
+        .and_then(|sum| sum.checked_sub(1))
+        .ok_or_else(|| Error::InvalidArguments("Job pagination range overflow".to_string()))?;
     let job_ids_bytes = db.lrange(&action_jobs_key, job_offset, job_stop)?;
 
     // Convert job IDs with proper error handling (not silent)
@@ -1838,7 +1867,7 @@ fn handle_actions_get(args: &[RespValue], db: &Database) -> Result<RespValue> {
     });
 
     let response_json = serde_json::to_string(&response)
-        .map_err(|e| Error::Protocol(format!("Failed to serialize response: {}", e)))?;
+        .map_err(|_| Error::Protocol("Failed to serialize response".to_string()))?;
 
     debug!("ACTION.GET {} -> {}/{} jobs (offset: {}, limit: {})",
            action_id, job_ids.len(), jobs_created, job_offset, job_limit);
