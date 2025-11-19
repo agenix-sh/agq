@@ -3162,3 +3162,95 @@ async fn test_jobs_list_malformed_limit() {
     assert!(response_str.starts_with("-"));
     assert!(response_str.contains("positive integer"));
 }
+
+/// Test JOB.GET command
+#[tokio::test]
+async fn test_job_get_requires_auth() {
+    let (_handle, port) = start_test_server().await;
+    let mut stream = TcpStream::connect(format!("127.0.0.1:{port}"))
+        .await
+        .expect("Failed to connect");
+
+    // Try JOB.GET without authentication
+    let cmd = b"*2\r\n$7\r\nJOB.GET\r\n$12\r\njob_test_123\r\n";
+    let response = send_resp_command(&mut stream, cmd).await;
+
+    let response_str = std::str::from_utf8(&response).unwrap();
+    assert!(response_str.contains("NOAUTH") || response_str.contains("not authenticated"));
+}
+
+#[tokio::test]
+async fn test_job_get_not_found() {
+    let (mut stream, _handle) = setup_authenticated_connection().await;
+
+    // Try to get non-existent job
+    let cmd = b"*2\r\n$7\r\nJOB.GET\r\n$20\r\njob_nonexistent_9999\r\n";
+    let response = send_resp_command(&mut stream, cmd).await;
+
+    let response_str = std::str::from_utf8(&response).unwrap();
+    assert!(response_str.starts_with("-"));
+    assert!(response_str.contains("Job not found"));
+}
+
+#[tokio::test]
+async fn test_job_get_success() {
+    let (mut stream, _handle) = setup_authenticated_connection().await;
+
+    // Submit a plan first
+    let plan_json = r#"{"plan_id":"plan_job_get_test","plan_description":"Test plan","tasks":[{"task_number":1,"command":"echo","args":["hello"]}]}"#;
+    let submit_cmd = format!(
+        "*2\r\n$11\r\nPLAN.SUBMIT\r\n${}\r\n{}\r\n",
+        plan_json.len(),
+        plan_json
+    );
+    send_resp_command(&mut stream, submit_cmd.as_bytes()).await;
+
+    // Submit an action to create a job
+    let action_json = r#"{"action_id":"action_job_get_test","plan_id":"plan_job_get_test","inputs":[{"input_id":"input1","data":"test_data"}]}"#;
+    let action_cmd = format!(
+        "*2\r\n$13\r\nACTION.SUBMIT\r\n${}\r\n{}\r\n",
+        action_json.len(),
+        action_json
+    );
+    let action_response = send_resp_command(&mut stream, action_cmd.as_bytes()).await;
+
+    // Parse action response to get job_id
+    let action_response_str = std::str::from_utf8(&action_response).unwrap();
+    // Response is bulk string containing JSON with job_ids array
+    let json_start = action_response_str.find('{').unwrap();
+    let json_str = &action_response_str[json_start..];
+    let response_json: serde_json::Value = serde_json::from_str(json_str).unwrap();
+    let job_id = response_json["job_ids"][0].as_str().unwrap();
+
+    // Now get the job
+    let job_get_cmd = format!("*2\r\n$7\r\nJOB.GET\r\n${}\r\n{}\r\n", job_id.len(), job_id);
+    let job_response = send_resp_command(&mut stream, job_get_cmd.as_bytes()).await;
+
+    let job_response_str = std::str::from_utf8(&job_response).unwrap();
+
+    // Verify job response contains expected fields
+    assert!(job_response_str.contains("job_id"));
+    assert!(job_response_str.contains("plan_id"));
+    assert!(job_response_str.contains("plan_job_get_test"));
+    assert!(job_response_str.contains("input"));
+    assert!(job_response_str.contains("status"));
+    assert!(job_response_str.contains("pending"));
+    assert!(job_response_str.contains("created_at"));
+
+    // Verify input data is preserved
+    assert!(job_response_str.contains("test_data"));
+}
+
+#[tokio::test]
+async fn test_job_get_validates_job_id() {
+    let (mut stream, _handle) = setup_authenticated_connection().await;
+
+    // Try JOB.GET with invalid job_id (contains invalid characters)
+    let cmd = b"*2\r\n$7\r\nJOB.GET\r\n$12\r\njob_id$%^&*(\r\n";
+    let response = send_resp_command(&mut stream, cmd).await;
+
+    let response_str = std::str::from_utf8(&response).unwrap();
+    assert!(response_str.starts_with("-"));
+    // Should get validation error
+    assert!(response_str.contains("invalid") || response_str.contains("alphanumeric"));
+}
