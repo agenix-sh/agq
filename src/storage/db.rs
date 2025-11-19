@@ -1725,6 +1725,96 @@ impl HashOps for Database {
         debug!("HLEN {} -> {}", key, count);
         Ok(count)
     }
+
+    fn hincrby(&self, key: &str, field: &str, increment: i64) -> Result<i64> {
+        let write_txn = self
+            .db
+            .begin_write()
+            .map_err(|e| Error::Protocol(format!("Failed to begin write transaction: {e}")))?;
+
+        let new_value = {
+            let mut table = write_txn
+                .open_table(HASH_TABLE)
+                .map_err(|e| Error::Protocol(format!("Failed to open hash table: {e}")))?;
+
+            let hash_key = format!("{}:{}", key, field);
+
+            // Get current value (default to 0 if not exists)
+            let existing_value = table
+                .get(hash_key.as_str())
+                .map_err(|e| Error::Protocol(format!("Failed to read hash field: {e}")))?;
+
+            let is_new_field = existing_value.is_none();
+
+            let current_value: i64 = existing_value
+                .as_ref()
+                .map(|v| {
+                    let bytes = v.value();
+                    std::str::from_utf8(bytes)
+                        .map_err(|e| Error::Protocol(format!("Invalid UTF-8 in hash field: {e}")))?
+                        .parse::<i64>()
+                        .map_err(|e| {
+                            Error::Protocol(format!("Hash field is not an integer: {e}"))
+                        })
+                })
+                .transpose()?
+                .unwrap_or(0);
+
+            // Drop existing_value to release borrow before doing range query
+            drop(existing_value);
+
+            // If field doesn't exist, check field count limit before creating
+            if is_new_field {
+                let prefix = format!("{}:", key);
+                let mut count: u64 = 0;
+
+                for item in table
+                    .range(prefix.as_str()..)
+                    .map_err(|e| Error::Protocol(format!("Failed to count fields: {e}")))?
+                {
+                    let (k, _) = item.map_err(|e| Error::Protocol(format!("Failed to read field: {e}")))?;
+                    let key_str = k.value();
+
+                    // Stop counting if we've moved past this hash's fields
+                    if !key_str.starts_with(&prefix) {
+                        break;
+                    }
+
+                    count = count
+                        .checked_add(1)
+                        .ok_or_else(|| Error::Protocol("Field count overflow".to_string()))?;
+                }
+
+                // Check if adding this field would exceed the limit
+                if count >= MAX_HASH_FIELDS {
+                    return Err(Error::Protocol(format!(
+                        "Hash field limit exceeded: {} (max: {})",
+                        count, MAX_HASH_FIELDS
+                    )));
+                }
+            }
+
+            // Calculate new value with overflow check
+            let new_value = current_value
+                .checked_add(increment)
+                .ok_or_else(|| Error::Protocol("Integer overflow in HINCRBY".to_string()))?;
+
+            // Store new value
+            let value_str = new_value.to_string();
+            table
+                .insert(hash_key.as_str(), value_str.as_bytes())
+                .map_err(|e| Error::Protocol(format!("Failed to write hash field: {e}")))?;
+
+            new_value
+        };
+
+        write_txn
+            .commit()
+            .map_err(|e| Error::Protocol(format!("Failed to commit transaction: {e}")))?;
+
+        debug!("HINCRBY {} {} {} -> {}", key, field, increment, new_value);
+        Ok(new_value)
+    }
 }
 
 #[cfg(test)]
@@ -2956,6 +3046,58 @@ mod tests {
         // Delete field
         db.hdel("job:123", "stderr").unwrap();
         assert_eq!(db.hlen("job:123").unwrap(), 2);
+    }
+
+    #[test]
+    fn test_hincrby() {
+        let (db, _temp) = test_db();
+
+        // Increment non-existent field (starts at 0)
+        let result = db.hincrby("stats:plan_abc", "total_actions", 1).unwrap();
+        assert_eq!(result, 1);
+
+        // Increment again
+        let result = db.hincrby("stats:plan_abc", "total_actions", 1).unwrap();
+        assert_eq!(result, 2);
+
+        // Increment by larger amount
+        let result = db.hincrby("stats:plan_abc", "total_actions", 10).unwrap();
+        assert_eq!(result, 12);
+
+        // Decrement (negative increment)
+        let result = db.hincrby("stats:plan_abc", "total_actions", -5).unwrap();
+        assert_eq!(result, 7);
+
+        // Verify the value is stored correctly
+        let value = db.hget("stats:plan_abc", "total_actions").unwrap().unwrap();
+        assert_eq!(std::str::from_utf8(&value).unwrap(), "7");
+    }
+
+    #[test]
+    fn test_hincrby_separate_fields() {
+        let (db, _temp) = test_db();
+
+        // Different fields in same hash should be independent
+        db.hincrby("stats:plan_abc", "total_actions", 5).unwrap();
+        db.hincrby("stats:plan_abc", "failed_count", 2).unwrap();
+
+        let actions = db.hincrby("stats:plan_abc", "total_actions", 0).unwrap();
+        let failures = db.hincrby("stats:plan_abc", "failed_count", 0).unwrap();
+
+        assert_eq!(actions, 5);
+        assert_eq!(failures, 2);
+    }
+
+    #[test]
+    fn test_hincrby_non_integer_error() {
+        let (db, _temp) = test_db();
+
+        // Set a non-integer value
+        db.hset("stats:plan_abc", "description", b"not a number").unwrap();
+
+        // Try to increment it - should fail
+        let result = db.hincrby("stats:plan_abc", "description", 1);
+        assert!(result.is_err());
     }
 
     #[test]

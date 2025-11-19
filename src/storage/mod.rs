@@ -378,4 +378,42 @@ pub trait HashOps {
     ///
     /// Returns an error if the database operation fails.
     fn hlen(&self, key: &str) -> Result<u64>;
+
+    /// Increment a field value in a hash by a given amount
+    ///
+    /// # Arguments
+    /// * `key` - The hash key
+    /// * `field` - The field name
+    /// * `increment` - The amount to increment by (can be negative)
+    ///
+    /// # Returns
+    /// The new value after incrementing
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if:
+    /// - The database operation fails
+    /// - The field contains a non-integer value
+    ///
+    /// # Behavior
+    /// - If the field doesn't exist, it's created with value 0 before incrementing
+    /// - If the field contains a non-integer value, returns an error
+    ///
+    /// # Examples
+    /// ```no_run
+    /// # use agq::storage::{Database, HashOps};
+    /// # let db = Database::open("test.redb").unwrap();
+    /// // Increment counter
+    /// let new_value = db.hincrby("stats:plan_abc", "total_actions", 1)?;
+    /// assert_eq!(new_value, 1);
+    ///
+    /// // Increment again
+    /// let new_value = db.hincrby("stats:plan_abc", "total_actions", 1)?;
+    /// assert_eq!(new_value, 2);
+    ///
+    /// // Decrement
+    /// let new_value = db.hincrby("stats:plan_abc", "failed_count", -1)?;
+    /// # Ok::<(), agq::error::Error>(())
+    /// ```
+    fn hincrby(&self, key: &str, field: &str, increment: i64) -> Result<i64>;
 }

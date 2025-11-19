@@ -142,12 +142,25 @@ async fn process_plan_job(db: &Database) -> Result<bool> {
 /// Store a plan in the database
 ///
 /// Creates:
-/// - Hash: `plan:<id>` with fields: json, status, created_at
+/// - Hash: `plan:<id>` with fields: json, status, created_at, task_count, plan_description
 /// - Sorted set: `plans:all` indexed by timestamp
 async fn store_plan(job: &InternalJob, db: &Database) -> Result<()> {
     let plan_key = format!("plan:{}", job.entity_id);
 
-    // Store plan hash
+    // Parse plan JSON to extract metadata (for efficient listing)
+    let plan_value: serde_json::Value = serde_json::from_str(&job.payload)
+        .map_err(|e| Error::Protocol(format!("Invalid plan JSON: {}", e)))?;
+
+    let task_count = plan_value["tasks"]
+        .as_array()
+        .map(|tasks| tasks.len())
+        .unwrap_or(0);
+
+    let plan_description = plan_value["plan_description"]
+        .as_str()
+        .unwrap_or("");
+
+    // Store plan hash with metadata
     db.hset(&plan_key, "json", job.payload.as_bytes())?;
     db.hset(&plan_key, "status", b"ready")?;
     db.hset(
@@ -155,6 +168,12 @@ async fn store_plan(job: &InternalJob, db: &Database) -> Result<()> {
         "created_at",
         job.timestamp.to_string().as_bytes(),
     )?;
+    db.hset(
+        &plan_key,
+        "task_count",
+        task_count.to_string().as_bytes(),
+    )?;
+    db.hset(&plan_key, "plan_description", plan_description.as_bytes())?;
 
     // Index plan in sorted set (for listing/discovery)
     db.zadd("plans:all", job.timestamp as f64, job.entity_id.as_bytes())?;

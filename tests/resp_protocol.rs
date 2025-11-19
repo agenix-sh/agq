@@ -65,10 +65,34 @@ async fn start_test_server() -> (tokio::task::JoinHandle<()>, u16) {
 async fn send_resp_command(stream: &mut TcpStream, command: &[u8]) -> Vec<u8> {
     stream.write_all(command).await.expect("Failed to write");
 
-    let mut response = vec![0u8; 1024];
+    let mut response = vec![0u8; 8192]; // Increased buffer size for larger responses
     let n = stream.read(&mut response).await.expect("Failed to read");
     response.truncate(n);
     response
+}
+
+/// Helper to create authenticated connection with retry logic
+async fn setup_authenticated_connection() -> (TcpStream, tokio::task::JoinHandle<()>) {
+    let (_handle, port) = start_test_server().await;
+
+    // Retry connection with exponential backoff
+    let mut retries = 10;
+    let mut stream = loop {
+        match TcpStream::connect(format!("127.0.0.1:{port}")).await {
+            Ok(s) => break s,
+            Err(e) if retries > 0 => {
+                retries -= 1;
+                tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+            }
+            Err(e) => panic!("Failed to connect after retries: {}", e),
+        }
+    };
+
+    // AUTH
+    let auth_cmd = b"*2\r\n$4\r\nAUTH\r\n$32\r\ntest_session_key_32_bytes_long!!\r\n";
+    send_resp_command(&mut stream, auth_cmd).await;
+
+    (stream, _handle)
 }
 
 #[tokio::test]
@@ -2667,4 +2691,219 @@ async fn test_action_submit_max_inputs_boundary() {
         error_msg.contains("exceeds maximum") || error_msg.contains("100"),
         "Error should mention 100 input limit"
     );
+}
+
+// ============================================================================
+// HINCRBY Tests
+// ============================================================================
+
+#[tokio::test]
+async fn test_hincrby_increment() {
+    let (_handle, port) = start_test_server().await;
+
+    let mut stream = TcpStream::connect(format!("127.0.0.1:{port}"))
+        .await
+        .expect("Failed to connect");
+
+    // AUTH first
+    let auth_cmd = b"*2\r\n$4\r\nAUTH\r\n$32\r\ntest_session_key_32_bytes_long!!\r\n";
+    send_resp_command(&mut stream, auth_cmd).await;
+
+    // Increment a counter (starts at 0)
+    let cmd = b"*4\r\n$7\r\nHINCRBY\r\n$15\r\nstats:plan_test\r\n$13\r\ntotal_actions\r\n$1\r\n1\r\n";
+    let response = send_resp_command(&mut stream, cmd).await;
+    assert_eq!(response, b":1\r\n");
+
+    // Increment again
+    let response = send_resp_command(&mut stream, cmd).await;
+    assert_eq!(response, b":2\r\n");
+
+    // Verify value with HGET
+    let get_cmd =
+        b"*3\r\n$4\r\nHGET\r\n$15\r\nstats:plan_test\r\n$13\r\ntotal_actions\r\n";
+    let response = send_resp_command(&mut stream, get_cmd).await;
+    assert_eq!(response, b"$1\r\n2\r\n");
+}
+
+#[tokio::test]
+async fn test_hincrby_decrement() {
+    let (_handle, port) = start_test_server().await;
+
+    let mut stream = TcpStream::connect(format!("127.0.0.1:{port}"))
+        .await
+        .expect("Failed to connect");
+
+    // AUTH first
+    let auth_cmd = b"*2\r\n$4\r\nAUTH\r\n$32\r\ntest_session_key_32_bytes_long!!\r\n";
+    send_resp_command(&mut stream, auth_cmd).await;
+
+    // Increment to 10
+    let cmd = b"*4\r\n$7\r\nHINCRBY\r\n$11\r\ntest:counter\r\n$5\r\nvalue\r\n$2\r\n10\r\n";
+    let response = send_resp_command(&mut stream, cmd).await;
+    assert_eq!(response, b":10\r\n");
+
+    // Decrement by 3
+    let cmd = b"*4\r\n$7\r\nHINCRBY\r\n$11\r\ntest:counter\r\n$5\r\nvalue\r\n$2\r\n-3\r\n";
+    let response = send_resp_command(&mut stream, cmd).await;
+    assert_eq!(response, b":7\r\n");
+}
+
+#[tokio::test]
+async fn test_hincrby_requires_auth() {
+    let (_handle, port) = start_test_server().await;
+
+    let mut stream = TcpStream::connect(format!("127.0.0.1:{port}"))
+        .await
+        .expect("Failed to connect");
+
+    let cmd = b"*4\r\n$7\r\nHINCRBY\r\n$8\r\ntest:key\r\n$5\r\nfield\r\n$1\r\n1\r\n";
+    let response = send_resp_command(&mut stream, cmd).await;
+    assert!(response.starts_with(b"-NOAUTH"));
+}
+
+#[tokio::test]
+async fn test_hincrby_invalid_args() {
+    let (mut stream, _handle) = setup_authenticated_connection().await;
+
+    // Missing increment argument
+    let cmd = b"*3\r\n$7\r\nHINCRBY\r\n$8\r\ntest:key\r\n$5\r\nfield\r\n";
+    let response = send_resp_command(&mut stream, cmd).await;
+    assert!(response.starts_with(b"-"));
+}
+
+// ============================================================================
+// PLAN.LIST and PLAN.GET Tests
+// ============================================================================
+
+#[tokio::test]
+async fn test_plan_list_empty() {
+    let (mut stream, _handle) = setup_authenticated_connection().await;
+
+    let cmd = b"*1\r\n$9\r\nPLAN.LIST\r\n";
+    let response = send_resp_command(&mut stream, cmd).await;
+
+    // Should return empty JSON array
+    let response_str = std::str::from_utf8(&response).unwrap();
+    assert!(response_str.contains("[]"), "Should return empty array");
+}
+
+#[tokio::test]
+async fn test_plan_list_with_plans() {
+    let (mut stream, _handle) = setup_authenticated_connection().await;
+
+    // Submit a plan first
+    let plan_json = r#"{"plan_id":"plan_list_test","plan_description":"Test plan","tasks":[{"task_number":1,"command":"echo hello"}]}"#;
+    let submit_cmd = format!(
+        "*2\r\n$11\r\nPLAN.SUBMIT\r\n${}\r\n{}\r\n",
+        plan_json.len(),
+        plan_json
+    );
+    send_resp_command(&mut stream, submit_cmd.as_bytes()).await;
+
+    // Now list plans
+    let cmd = b"*1\r\n$9\r\nPLAN.LIST\r\n";
+    let response = send_resp_command(&mut stream, cmd).await;
+
+    let response_str = std::str::from_utf8(&response).unwrap();
+    assert!(response_str.contains("plan_list_test"));
+    assert!(response_str.contains("Test plan"));
+    assert!(response_str.contains("task_count"));
+}
+
+#[tokio::test]
+async fn test_plan_get() {
+    let (mut stream, _handle) = setup_authenticated_connection().await;
+
+    // Submit a plan
+    let plan_json = r#"{"plan_id":"plan_get_test","plan_description":"Get test","tasks":[{"task_number":1,"command":"ls"}]}"#;
+    let submit_cmd = format!(
+        "*2\r\n$11\r\nPLAN.SUBMIT\r\n${}\r\n{}\r\n",
+        plan_json.len(),
+        plan_json
+    );
+    send_resp_command(&mut stream, submit_cmd.as_bytes()).await;
+
+    // Get the plan
+    let cmd = b"*2\r\n$8\r\nPLAN.GET\r\n$13\r\nplan_get_test\r\n";
+    let response = send_resp_command(&mut stream, cmd).await;
+
+    let response_str = std::str::from_utf8(&response).unwrap();
+    assert!(response_str.contains("plan_get_test"));
+    assert!(response_str.contains("Get test"));
+    assert!(response_str.contains("metadata"));
+    assert!(response_str.contains("created_at"));
+}
+
+#[tokio::test]
+async fn test_plan_get_not_found() {
+    let (mut stream, _handle) = setup_authenticated_connection().await;
+
+    let cmd = b"*2\r\n$8\r\nPLAN.GET\r\n$16\r\nnonexistent_plan\r\n";
+    let response = send_resp_command(&mut stream, cmd).await;
+
+    assert!(response.starts_with(b"-"));
+    let error_msg = std::str::from_utf8(&response).unwrap();
+    assert!(error_msg.contains("not found"));
+}
+
+// ============================================================================
+// ACTION.GET Tests
+// ============================================================================
+
+#[tokio::test]
+async fn test_action_get() {
+    let (mut stream, _handle) = setup_authenticated_connection().await;
+
+    // Submit a plan first
+    let plan_json = r#"{"plan_id":"plan_action_test","tasks":[{"task_number":1,"command":"echo"}]}"#;
+    let submit_cmd = format!(
+        "*2\r\n$11\r\nPLAN.SUBMIT\r\n${}\r\n{}\r\n",
+        plan_json.len(),
+        plan_json
+    );
+    send_resp_command(&mut stream, submit_cmd.as_bytes()).await;
+
+    // Submit an action
+    let action_json =
+        r#"{"action_id":"action_get_test","plan_id":"plan_action_test","inputs":[{"file":"test.txt"}]}"#;
+    let action_cmd = format!(
+        "*2\r\n$13\r\nACTION.SUBMIT\r\n${}\r\n{}\r\n",
+        action_json.len(),
+        action_json
+    );
+    send_resp_command(&mut stream, action_cmd.as_bytes()).await;
+
+    // Get the action
+    let cmd = b"*2\r\n$10\r\nACTION.GET\r\n$15\r\naction_get_test\r\n";
+    let response = send_resp_command(&mut stream, cmd).await;
+
+    let response_str = std::str::from_utf8(&response).unwrap();
+    assert!(response_str.contains("action_get_test"));
+    assert!(response_str.contains("plan_action_test"));
+    assert!(response_str.contains("jobs_total"));
+    assert!(response_str.contains("job_ids"));
+}
+
+#[tokio::test]
+async fn test_action_get_not_found() {
+    let (mut stream, _handle) = setup_authenticated_connection().await;
+
+    let cmd = b"*2\r\n$10\r\nACTION.GET\r\n$18\r\nnonexistent_action\r\n";
+    let response = send_resp_command(&mut stream, cmd).await;
+
+    assert!(response.starts_with(b"-"));
+    let error_msg = std::str::from_utf8(&response).unwrap();
+    assert!(error_msg.contains("not found"));
+}
+
+#[tokio::test]
+async fn test_action_list_empty() {
+    let (mut stream, _handle) = setup_authenticated_connection().await;
+
+    let cmd = b"*1\r\n$11\r\nACTION.LIST\r\n";
+    let response = send_resp_command(&mut stream, cmd).await;
+
+    // Should return empty JSON array (ACTION.LIST not fully implemented yet)
+    let response_str = std::str::from_utf8(&response).unwrap();
+    assert!(response_str.contains("[]"));
 }
