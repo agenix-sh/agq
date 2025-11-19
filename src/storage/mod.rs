@@ -166,7 +166,16 @@ pub trait ListOps {
     ///
     /// # Errors
     ///
-    /// Returns an error if the database operation fails.
+    /// Returns an error if the database operation fails or if input validation fails.
+    ///
+    /// # Performance
+    /// - Time complexity: O(N) where N is the list length
+    /// - Space complexity: O(N) due to list compaction
+    /// - After removal, the list is compacted to maintain contiguous indices
+    ///
+    /// # Note
+    /// This operation requires reading the entire list into memory for compaction.
+    /// For very large lists, consider the performance implications.
     ///
     /// # Examples
     /// ```no_run

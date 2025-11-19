@@ -51,6 +51,14 @@ const MAX_FIELD_NAME_SIZE: usize = 1_048_576; // 1MB
 /// Prevents DoS attacks through extremely large values
 const MAX_FIELD_VALUE_SIZE: usize = 10_485_760; // 10MB
 
+/// Maximum key length for LREM operations (1MB)
+/// Prevents DoS attacks through extremely large keys
+const MAX_LREM_KEY_LENGTH: usize = 1_048_576; // 1MB
+
+/// Maximum element size for LREM operations (10MB)
+/// Prevents DoS attacks through extremely large elements
+const MAX_LREM_ELEMENT_SIZE: usize = 10_485_760; // 10MB
+
 /// AGQ Database wrapper
 ///
 /// Provides ACID-compliant embedded storage using redb.
@@ -1024,6 +1032,31 @@ impl ListOps for Database {
     }
 
     fn lrem(&self, key: &str, count: i64, element: &[u8]) -> Result<i64> {
+        // Security: Validate key length
+        if key.len() > MAX_LREM_KEY_LENGTH {
+            return Err(Error::InvalidArguments(format!(
+                "Key length {} exceeds maximum {}",
+                key.len(),
+                MAX_LREM_KEY_LENGTH
+            )));
+        }
+
+        // Security: Validate element size
+        if element.len() > MAX_LREM_ELEMENT_SIZE {
+            return Err(Error::InvalidArguments(format!(
+                "Element size {} exceeds maximum {}",
+                element.len(),
+                MAX_LREM_ELEMENT_SIZE
+            )));
+        }
+
+        // Security: Handle i64::MIN edge case for count
+        if count == i64::MIN {
+            return Err(Error::InvalidArguments(
+                "Invalid count value".to_string(),
+            ));
+        }
+
         // Begin write transaction
         let write_txn = self
             .db
@@ -1042,118 +1075,136 @@ impl ListOps for Database {
             let (head, tail) = match meta_table.get(key) {
                 Ok(Some(meta)) => decode_list_meta(meta.value())?,
                 Ok(None) => {
-                    // List doesn't exist
-                    return Ok(0);
+                    // List doesn't exist - return early without removing anything
+                    drop(meta_table);
+                    drop(data_table);
+                    0 // Will be returned after transaction commit
                 }
-                Err(e) => return Err(Error::Protocol(format!("Failed to get list metadata: {e}"))),
+                Err(e) => {
+                    return Err(Error::Protocol(format!("Failed to get list metadata: {e}")))
+                }
             };
 
             // If list is empty
             if head > tail {
-                return Ok(0);
-            }
-
-            // Collect elements and their indices
-            let mut elements = Vec::new();
-            for idx in head..=tail {
-                let element_key = list_element_key(key, idx);
-                if let Ok(Some(value)) = data_table.get(element_key.as_str()) {
-                    elements.push((idx, value.value().to_vec()));
-                }
-            }
-
-            // Determine which elements to remove
-            let mut removed_count = 0i64;
-            let mut indices_to_remove = Vec::new();
-
-            if count == 0 {
-                // Remove all occurrences
-                for (idx, value) in &elements {
-                    if value == element {
-                        indices_to_remove.push(*idx);
-                        removed_count += 1;
-                    }
-                }
-            } else if count > 0 {
-                // Remove first N occurrences (head to tail)
-                let mut remaining = count;
-                for (idx, value) in &elements {
-                    if remaining > 0 && value == element {
-                        indices_to_remove.push(*idx);
-                        removed_count += 1;
-                        remaining -= 1;
-                    }
-                }
+                drop(meta_table);
+                drop(data_table);
+                0 // Will be returned after transaction commit
             } else {
-                // Remove last N occurrences (tail to head)
-                let mut remaining = count.abs();
-                for (idx, value) in elements.iter().rev() {
-                    if remaining > 0 && value == element {
-                        indices_to_remove.push(*idx);
-                        removed_count += 1;
-                        remaining -= 1;
-                    }
-                }
-            }
-
-            // Remove the elements
-            for idx in &indices_to_remove {
-                let element_key = list_element_key(key, *idx);
-                data_table
-                    .remove(element_key.as_str())
-                    .map_err(|e| Error::Protocol(format!("Failed to remove element: {e}")))?;
-            }
-
-            // If we removed elements, we need to re-compact the list
-            if removed_count > 0 {
-                // Collect remaining elements in order
-                let mut remaining_elements = Vec::new();
+                // Collect elements and their indices, with capacity pre-allocation
+                let list_size = (tail - head + 1) as usize;
+                let mut elements = Vec::with_capacity(list_size);
                 for idx in head..=tail {
                     let element_key = list_element_key(key, idx);
                     if let Ok(Some(value)) = data_table.get(element_key.as_str()) {
-                        remaining_elements.push(value.value().to_vec());
+                        elements.push((idx, value.value().to_vec()));
                     }
                 }
 
-                if remaining_elements.is_empty() {
-                    // List is now empty, remove metadata
-                    meta_table
-                        .remove(key)
-                        .map_err(|e| Error::Protocol(format!("Failed to remove metadata: {e}")))?;
+                // Determine which elements to remove and collect remaining elements in a single pass
+                let mut removed_count = 0i64;
+                let indices_to_remove: std::collections::HashSet<i64>;
+
+                if count == 0 {
+                    // Remove all occurrences
+                    indices_to_remove = elements
+                        .iter()
+                        .filter_map(|(idx, value)| {
+                            if value == element {
+                                removed_count += 1;
+                                Some(*idx)
+                            } else {
+                                None
+                            }
+                        })
+                        .collect();
+                } else if count > 0 {
+                    // Remove first N occurrences (head to tail)
+                    let mut count_left = count;
+                    indices_to_remove = elements
+                        .iter()
+                        .filter_map(|(idx, value)| {
+                            if count_left > 0 && value == element {
+                                count_left -= 1;
+                                removed_count += 1;
+                                Some(*idx)
+                            } else {
+                                None
+                            }
+                        })
+                        .collect();
                 } else {
-                    // Re-write the list with new indices starting from head
-                    let new_tail = head
-                        .checked_add(remaining_elements.len() as i64 - 1)
-                        .ok_or_else(|| Error::Protocol("Index overflow".to_string()))?;
-
-                    // First, remove all old elements
-                    for idx in head..=tail {
-                        let element_key = list_element_key(key, idx);
-                        let _ = data_table.remove(element_key.as_str());
-                    }
-
-                    // Write remaining elements with new indices
-                    for (offset, value) in remaining_elements.iter().enumerate() {
-                        let new_idx = head
-                            .checked_add(offset as i64)
-                            .ok_or_else(|| Error::Protocol("Index overflow".to_string()))?;
-                        let element_key = list_element_key(key, new_idx);
-                        data_table
-                            .insert(element_key.as_str(), value.as_slice())
-                            .map_err(|e| {
-                                Error::Protocol(format!("Failed to reinsert element: {e}"))
-                            })?;
-                    }
-
-                    // Update metadata with new tail
-                    let new_meta = encode_list_meta(head, new_tail);
-                    meta_table.insert(key, &new_meta[..]).map_err(|e| {
-                        Error::Protocol(format!("Failed to update metadata: {e}"))
-                    })?;
+                    // Remove last N occurrences (tail to head)
+                    let mut count_left = count.abs();
+                    indices_to_remove = elements
+                        .iter()
+                        .rev()
+                        .filter_map(|(idx, value)| {
+                            if count_left > 0 && value == element {
+                                count_left -= 1;
+                                removed_count += 1;
+                                Some(*idx)
+                            } else {
+                                None
+                            }
+                        })
+                        .collect();
                 }
-            }
 
-            removed_count
+                // If we removed elements, we need to re-compact the list
+                if removed_count > 0 {
+                    // Collect remaining elements in order (single pass - no double scan)
+                    let remaining_elements: Vec<Vec<u8>> = elements
+                        .into_iter()
+                        .filter_map(|(idx, value)| {
+                            if !indices_to_remove.contains(&idx) {
+                                Some(value)
+                            } else {
+                                None
+                            }
+                        })
+                        .collect();
+
+                    if remaining_elements.is_empty() {
+                        // List is now empty, remove metadata
+                        meta_table
+                            .remove(key)
+                            .map_err(|e| Error::Protocol(format!("Failed to remove metadata: {e}")))?;
+                    } else {
+                        // Re-write the list with new indices starting from head
+                        let new_tail = head
+                            .checked_add(remaining_elements.len() as i64 - 1)
+                            .ok_or_else(|| Error::Protocol("Index overflow".to_string()))?;
+
+                        // First, remove all old elements
+                        for idx in head..=tail {
+                            let element_key = list_element_key(key, idx);
+                            let _ = data_table.remove(element_key.as_str());
+                        }
+
+                        // Write remaining elements with new indices
+                        for (offset, value) in remaining_elements.iter().enumerate() {
+                            let new_idx = head
+                                .checked_add(offset as i64)
+                                .ok_or_else(|| Error::Protocol("Index overflow".to_string()))?;
+                            let element_key = list_element_key(key, new_idx);
+                            data_table
+                                .insert(element_key.as_str(), value.as_slice())
+                                .map_err(|e| {
+                                    Error::Protocol(format!("Failed to reinsert element: {e}"))
+                                })?;
+                        }
+
+                        // Update metadata with new tail
+                        let new_meta = encode_list_meta(head, new_tail);
+                        meta_table.insert(key, &new_meta[..]).map_err(|e| {
+                            Error::Protocol(format!("Failed to update metadata: {e}"))
+                        })?;
+                    }
+                }
+
+                removed_count
+            }
         };
 
         // Commit transaction
@@ -2405,6 +2456,58 @@ mod tests {
             db.lrange("queue:processing", 0, -1).unwrap(),
             vec![b"job_456".to_vec()]
         );
+    }
+
+    #[test]
+    fn test_lrem_extreme_count_values() {
+        let (db, _temp) = test_db();
+
+        // Setup list
+        db.lpush("list", b"a").unwrap();
+        db.lpush("list", b"b").unwrap();
+        db.lpush("list", b"a").unwrap();
+
+        // Test i64::MIN should error
+        let result = db.lrem("list", i64::MIN, b"a");
+        assert!(result.is_err());
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("Invalid count value"));
+
+        // Test very large negative count (should remove all matching)
+        let removed = db.lrem("list", -1000, b"a").unwrap();
+        assert_eq!(removed, 2); // Only 2 'a' elements exist
+    }
+
+    #[test]
+    fn test_lrem_oversized_key() {
+        let (db, _temp) = test_db();
+
+        // Create a key that exceeds MAX_LREM_KEY_LENGTH
+        let oversized_key = "a".repeat(MAX_LREM_KEY_LENGTH + 1);
+
+        let result = db.lrem(&oversized_key, 1, b"value");
+        assert!(result.is_err());
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("exceeds maximum"));
+    }
+
+    #[test]
+    fn test_lrem_oversized_element() {
+        let (db, _temp) = test_db();
+
+        // Create an element that exceeds MAX_LREM_ELEMENT_SIZE
+        let oversized_element = vec![b'X'; MAX_LREM_ELEMENT_SIZE + 1];
+
+        let result = db.lrem("list", 1, &oversized_element);
+        assert!(result.is_err());
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("exceeds maximum"));
     }
 
     // Sorted Set Tests
