@@ -361,6 +361,24 @@ async fn handle_command(
                 _ => Err(Error::Protocol(format!("Unknown ACTION command: {}", cmd))),
             }
         }
+        "JOBS.LIST" => {
+            if !*authenticated {
+                return Err(Error::NoAuth);
+            }
+            handle_jobs_list(&args, db)
+        }
+        "WORKERS.LIST" => {
+            if !*authenticated {
+                return Err(Error::NoAuth);
+            }
+            handle_workers_list(&args, db)
+        }
+        "QUEUE.STATS" => {
+            if !*authenticated {
+                return Err(Error::NoAuth);
+            }
+            handle_queue_stats(&args, db)
+        }
         _ => {
             if !*authenticated {
                 return Err(Error::NoAuth);
@@ -2161,6 +2179,126 @@ fn handle_actions_get(args: &[RespValue], db: &Database) -> Result<RespValue> {
     debug!("ACTION.GET {} -> {}/{} jobs (completed: {}, failed: {}, pending: {})",
            action_id, job_ids.len(), jobs_total, jobs_completed, jobs_failed, jobs_pending);
     Ok(RespValue::BulkString(response_json.into_bytes()))
+}
+
+/// Handle JOBS.LIST command
+///
+/// Returns a simple array of job information.
+/// Format: [job_id, status, created_at, job_id, status, created_at, ...]
+///
+/// # Security
+/// - Requires authentication
+/// - Supports pagination to prevent DoS via large result sets
+///
+/// # Arguments
+/// * `args` - RESP arguments: [command, offset?, limit?]
+/// * `db` - Database handle
+///
+/// # Note
+/// Currently AGQ doesn't maintain a global jobs:all index, so this implementation
+/// will need to be enhanced when such an index is added. For now, it returns
+/// an empty array as a placeholder.
+fn handle_jobs_list(args: &[RespValue], _db: &Database) -> Result<RespValue> {
+    const DEFAULT_LIMIT: u64 = 100;
+    const MAX_LIMIT: u64 = 1000;
+
+    // Parse optional offset and limit arguments
+    // Using u64 enforces non-negativity at type level
+    let offset = if args.len() > 1 {
+        args[1].as_string()?.parse::<u64>()
+            .map_err(|_| Error::InvalidArguments("offset must be a non-negative integer".to_string()))?
+    } else {
+        0
+    };
+
+    let limit = if args.len() > 2 {
+        let requested = args[2].as_string()?.parse::<u64>()
+            .map_err(|_| Error::InvalidArguments("limit must be a positive integer".to_string()))?;
+        if requested == 0 {
+            return Err(Error::InvalidArguments("limit must be > 0".to_string()));
+        }
+        requested.min(MAX_LIMIT) // Enforce maximum
+    } else {
+        DEFAULT_LIMIT
+    };
+
+    // NOTE: AGQ currently doesn't maintain a global jobs:all index
+    // Jobs are only indexed by action (action:{action_id}:jobs)
+    // This is a placeholder implementation that returns empty array
+    // TODO(#43): When jobs:all sorted set is added, implement proper listing
+    // See: https://github.com/agenix-sh/agq/issues/43#future-work
+
+    let jobs: Vec<RespValue> = Vec::new();
+
+    debug!("JOBS.LIST -> {} jobs (offset: {}, limit: {})", jobs.len(), offset, limit);
+    Ok(RespValue::Array(jobs))
+}
+
+/// Handle WORKERS.LIST command
+///
+/// Returns array of worker IDs currently registered with AGQ.
+///
+/// # Security
+/// - Requires authentication
+///
+/// # Arguments
+/// * `args` - RESP arguments: [command]
+/// * `db` - Database handle
+///
+/// # Note
+/// AGQ doesn't currently track workers (AGW connects directly to pull jobs).
+/// This is a placeholder that returns empty array until worker registration is implemented.
+fn handle_workers_list(_args: &[RespValue], _db: &Database) -> Result<RespValue> {
+    // NOTE: AGQ currently doesn't track workers
+    // Workers connect via BRPOP and don't register themselves
+    // This is a placeholder implementation that returns empty array
+    // TODO(#43): When worker registration is added, implement proper listing
+    // See: https://github.com/agenix-sh/agq/issues/43#future-work
+
+    let workers: Vec<RespValue> = Vec::new();
+
+    debug!("WORKERS.LIST -> {} workers", workers.len());
+    Ok(RespValue::Array(workers))
+}
+
+/// Handle QUEUE.STATS command
+///
+/// Returns queue statistics as a flat array of field-value pairs:
+/// [field1, value1, field2, value2, ...]
+///
+/// # Security
+/// - Requires authentication
+///
+/// # Arguments
+/// * `args` - RESP arguments: [command]
+/// * `db` - Database handle
+///
+/// # Statistics Returned
+/// - pending_jobs: Number of jobs in queue:ready
+/// - scheduled_jobs: Number of jobs in queue:scheduled (if exists)
+fn handle_queue_stats(_args: &[RespValue], db: &Database) -> Result<RespValue> {
+    // Get pending jobs count from queue:ready
+    let pending_jobs = db.llen("queue:ready")?;
+
+    // Get scheduled jobs count from queue:scheduled
+    // Note: AGQ doesn't currently use queue:scheduled, but we check for future compatibility
+    // If the list doesn't exist, llen returns 0 (not an error), but we handle actual errors
+    let scheduled_jobs = db.llen("queue:scheduled")?;
+
+    // Return as flat array: [field1, value1, field2, value2, ...]
+    // This matches Redis HGETALL format
+    //
+    // Resource bounds: Currently returns 2 fields (4 array elements).
+    // If additional stats are added in future, consider pagination or limits.
+    let stats = vec![
+        RespValue::BulkString(b"pending_jobs".to_vec()),
+        RespValue::BulkString(pending_jobs.to_string().into_bytes()),
+        RespValue::BulkString(b"scheduled_jobs".to_vec()),
+        RespValue::BulkString(scheduled_jobs.to_string().into_bytes()),
+    ];
+
+    debug!("QUEUE.STATS -> pending: {}, scheduled: {}", pending_jobs, scheduled_jobs);
+    Ok(RespValue::Array(stats))
 }
 
 #[cfg(test)]

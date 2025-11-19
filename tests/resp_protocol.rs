@@ -2954,3 +2954,211 @@ async fn test_action_list_with_actions() {
     assert!(response_str.contains("jobs_failed"));
     assert!(response_str.contains("jobs_pending"));
 }
+
+/// Test JOBS.LIST command
+#[tokio::test]
+async fn test_jobs_list_requires_auth() {
+    let (_handle, port) = start_test_server().await;
+    let mut stream = TcpStream::connect(format!("127.0.0.1:{port}"))
+        .await
+        .expect("Failed to connect");
+
+    // Try JOBS.LIST without authentication
+    let cmd = b"*1\r\n$9\r\nJOBS.LIST\r\n";
+    let response = send_resp_command(&mut stream, cmd).await;
+
+    // Should get NOAUTH error
+    let response_str = std::str::from_utf8(&response).unwrap();
+    assert!(response_str.contains("NOAUTH") || response_str.contains("not authenticated"));
+}
+
+#[tokio::test]
+async fn test_jobs_list_empty() {
+    let (mut stream, _handle) = setup_authenticated_connection().await;
+
+    // JOBS.LIST should return empty array (no jobs:all index yet)
+    let cmd = b"*1\r\n$9\r\nJOBS.LIST\r\n";
+    let response = send_resp_command(&mut stream, cmd).await;
+
+    // Should get empty array: *0\r\n
+    let response_str = std::str::from_utf8(&response).unwrap();
+    assert!(response_str.starts_with("*0") || response_str == "*0\r\n");
+}
+
+#[tokio::test]
+async fn test_jobs_list_with_pagination() {
+    let (mut stream, _handle) = setup_authenticated_connection().await;
+
+    // JOBS.LIST with offset and limit
+    let cmd = b"*3\r\n$9\r\nJOBS.LIST\r\n$1\r\n0\r\n$2\r\n10\r\n";
+    let response = send_resp_command(&mut stream, cmd).await;
+
+    // Should get empty array (no jobs:all index yet)
+    let response_str = std::str::from_utf8(&response).unwrap();
+    assert!(response_str.starts_with("*0") || response_str == "*0\r\n");
+}
+
+/// Test WORKERS.LIST command
+#[tokio::test]
+async fn test_workers_list_requires_auth() {
+    let (_handle, port) = start_test_server().await;
+    let mut stream = TcpStream::connect(format!("127.0.0.1:{port}"))
+        .await
+        .expect("Failed to connect");
+
+    // Try WORKERS.LIST without authentication
+    let cmd = b"*1\r\n$12\r\nWORKERS.LIST\r\n";
+    let response = send_resp_command(&mut stream, cmd).await;
+
+    // Should get NOAUTH error
+    let response_str = std::str::from_utf8(&response).unwrap();
+    assert!(response_str.contains("NOAUTH") || response_str.contains("not authenticated"));
+}
+
+#[tokio::test]
+async fn test_workers_list_empty() {
+    let (mut stream, _handle) = setup_authenticated_connection().await;
+
+    // WORKERS.LIST should return empty array (no worker tracking yet)
+    let cmd = b"*1\r\n$12\r\nWORKERS.LIST\r\n";
+    let response = send_resp_command(&mut stream, cmd).await;
+
+    // Should get empty array: *0\r\n
+    let response_str = std::str::from_utf8(&response).unwrap();
+    assert!(response_str.starts_with("*0") || response_str == "*0\r\n");
+}
+
+/// Test QUEUE.STATS command
+#[tokio::test]
+async fn test_queue_stats_requires_auth() {
+    let (_handle, port) = start_test_server().await;
+    let mut stream = TcpStream::connect(format!("127.0.0.1:{port}"))
+        .await
+        .expect("Failed to connect");
+
+    // Try QUEUE.STATS without authentication
+    let cmd = b"*1\r\n$11\r\nQUEUE.STATS\r\n";
+    let response = send_resp_command(&mut stream, cmd).await;
+
+    // Should get NOAUTH error
+    let response_str = std::str::from_utf8(&response).unwrap();
+    assert!(response_str.contains("NOAUTH") || response_str.contains("not authenticated"));
+}
+
+#[tokio::test]
+async fn test_queue_stats_empty() {
+    let (mut stream, _handle) = setup_authenticated_connection().await;
+
+    // QUEUE.STATS should return stats array
+    let cmd = b"*1\r\n$11\r\nQUEUE.STATS\r\n";
+    let response = send_resp_command(&mut stream, cmd).await;
+
+    let response_str = std::str::from_utf8(&response).unwrap();
+    // Should contain pending_jobs and scheduled_jobs fields
+    assert!(response_str.contains("pending_jobs"));
+    assert!(response_str.contains("scheduled_jobs"));
+}
+
+#[tokio::test]
+async fn test_queue_stats_with_jobs() {
+    let (mut stream, _handle) = setup_authenticated_connection().await;
+
+    // Submit a plan and action to create jobs
+    let plan_json = r#"{"plan_id":"plan_queue_stats_test","plan_description":"Test plan","tasks":[{"task_number":1,"command":"echo test"}]}"#;
+    let submit_cmd = format!(
+        "*2\r\n$11\r\nPLAN.SUBMIT\r\n${}\r\n{}\r\n",
+        plan_json.len(),
+        plan_json
+    );
+    send_resp_command(&mut stream, submit_cmd.as_bytes()).await;
+
+    // Submit an action to create jobs in queue
+    let action_json = r#"{"action_id":"action_queue_stats_test","plan_id":"plan_queue_stats_test","inputs":[{"input_id":"input1","data":"test"}]}"#;
+    let action_cmd = format!(
+        "*2\r\n$13\r\nACTION.SUBMIT\r\n${}\r\n{}\r\n",
+        action_json.len(),
+        action_json
+    );
+    send_resp_command(&mut stream, action_cmd.as_bytes()).await;
+
+    // Get queue stats
+    let cmd = b"*1\r\n$11\r\nQUEUE.STATS\r\n";
+    let response = send_resp_command(&mut stream, cmd).await;
+
+    let response_str = std::str::from_utf8(&response).unwrap();
+    // Should show pending_jobs > 0
+    assert!(response_str.contains("pending_jobs"));
+    // Response format is array: [field1, value1, field2, value2]
+    // We should see at least 4 elements (2 fields × 2 values)
+    assert!(response_str.starts_with("*4"));
+}
+
+/// Test JOBS.LIST edge cases - input validation
+#[tokio::test]
+async fn test_jobs_list_negative_offset() {
+    let (mut stream, _handle) = setup_authenticated_connection().await;
+
+    // Try JOBS.LIST with negative offset (should be rejected by u64 parsing)
+    let cmd = b"*3\r\n$9\r\nJOBS.LIST\r\n$2\r\n-1\r\n$2\r\n10\r\n";
+    let response = send_resp_command(&mut stream, cmd).await;
+
+    let response_str = std::str::from_utf8(&response).unwrap();
+    // Should get error about invalid offset
+    assert!(response_str.starts_with("-") || response_str.contains("ERR"));
+}
+
+#[tokio::test]
+async fn test_jobs_list_zero_limit() {
+    let (mut stream, _handle) = setup_authenticated_connection().await;
+
+    // Try JOBS.LIST with limit = 0 (should be rejected)
+    let cmd = b"*3\r\n$9\r\nJOBS.LIST\r\n$1\r\n0\r\n$1\r\n0\r\n";
+    let response = send_resp_command(&mut stream, cmd).await;
+
+    let response_str = std::str::from_utf8(&response).unwrap();
+    // Should get error about limit must be > 0
+    assert!(response_str.starts_with("-"));
+    assert!(response_str.contains("limit must be > 0"));
+}
+
+#[tokio::test]
+async fn test_jobs_list_limit_capped_at_max() {
+    let (mut stream, _handle) = setup_authenticated_connection().await;
+
+    // Try JOBS.LIST with limit > MAX_LIMIT (1000)
+    // Should be capped at 1000, not rejected
+    let cmd = b"*3\r\n$9\r\nJOBS.LIST\r\n$1\r\n0\r\n$4\r\n9999\r\n";
+    let response = send_resp_command(&mut stream, cmd).await;
+
+    let response_str = std::str::from_utf8(&response).unwrap();
+    // Should succeed (capped at max, but still returns empty array)
+    assert!(response_str.starts_with("*0") || response_str == "*0\r\n");
+}
+
+#[tokio::test]
+async fn test_jobs_list_malformed_offset() {
+    let (mut stream, _handle) = setup_authenticated_connection().await;
+
+    // Try JOBS.LIST with non-numeric offset
+    let cmd = b"*3\r\n$9\r\nJOBS.LIST\r\n$3\r\nabc\r\n$2\r\n10\r\n";
+    let response = send_resp_command(&mut stream, cmd).await;
+
+    let response_str = std::str::from_utf8(&response).unwrap();
+    // Should get parse error
+    assert!(response_str.starts_with("-"));
+    assert!(response_str.contains("non-negative integer"));
+}
+
+#[tokio::test]
+async fn test_jobs_list_malformed_limit() {
+    let (mut stream, _handle) = setup_authenticated_connection().await;
+
+    // Try JOBS.LIST with non-numeric limit
+    let cmd = b"*3\r\n$9\r\nJOBS.LIST\r\n$1\r\n0\r\n$3\r\nxyz\r\n";
+    let response = send_resp_command(&mut stream, cmd).await;
+
+    let response_str = std::str::from_utf8(&response).unwrap();
+    // Should get parse error
+    assert!(response_str.starts_with("-"));
+    assert!(response_str.contains("positive integer"));
+}
