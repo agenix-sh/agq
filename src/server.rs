@@ -367,6 +367,12 @@ async fn handle_command(
             }
             handle_jobs_list(&args, db)
         }
+        "JOB.GET" => {
+            if !*authenticated {
+                return Err(Error::NoAuth);
+            }
+            handle_job_get(&args, db)
+        }
         "WORKERS.LIST" => {
             if !*authenticated {
                 return Err(Error::NoAuth);
@@ -1484,6 +1490,20 @@ static ACTION_SUBMIT_LIMITER: Lazy<
     >,
 > = Lazy::new(|| governor::RateLimiter::direct(Quota::per_minute(NonZeroU32::new(100).unwrap())));
 
+/// Rate limiter for JOB.GET command
+///
+/// # Rate Limit
+/// - 6000 requests/minute globally (100 requests/second)
+/// - Prevents DoS from malicious or misconfigured workers polling repeatedly
+/// - Higher limit than ACTION_SUBMIT as JOB.GET is lightweight (hash lookup only)
+static JOB_GET_LIMITER: Lazy<
+    governor::RateLimiter<
+        governor::state::direct::NotKeyed,
+        governor::state::InMemoryState,
+        governor::clock::DefaultClock,
+    >,
+> = Lazy::new(|| governor::RateLimiter::direct(Quota::per_minute(NonZeroU32::new(6000).unwrap())));
+
 /// Handle ACTION.SUBMIT command (Layer 4 - Action execution)
 ///
 /// Syntax: ACTION.SUBMIT <action_json>
@@ -1601,11 +1621,9 @@ fn handle_action_submit(args: &[RespValue], db: &Database) -> Result<RespValue> 
         )));
     }
 
-    let plan_json = std::str::from_utf8(&plan_json_bytes)
+    // Verify plan JSON is valid UTF-8 (but don't parse - workers will fetch plan separately)
+    let _plan_json = std::str::from_utf8(&plan_json_bytes)
         .map_err(|e| Error::Protocol(format!("Plan JSON is not valid UTF-8: {}", e)))?;
-
-    let plan_value: serde_json::Value = serde_json::from_str(plan_json)
-        .map_err(|e| Error::Protocol(format!("Plan JSON is invalid: {}", e)))?;
 
     // Create Jobs (one per input)
     let mut job_ids = Vec::new();
@@ -1618,12 +1636,17 @@ fn handle_action_submit(args: &[RespValue], db: &Database) -> Result<RespValue> 
         // Generate unique job_id
         let job_id = format!("job_{}", Uuid::new_v4().simple());
 
-        // Create Job = Plan + job_id + input
-        // Per Layer 2→3 transition: Plans don't have job_id, Jobs do
-        let mut job_value = plan_value.clone();
-        job_value["job_id"] = serde_json::Value::String(job_id.clone());
-        job_value["input"] = input.clone();
-        job_value["input_index"] = serde_json::Value::Number(input_index.into());
+        // Create Job with plan_id reference (NOT embedded plan)
+        // Per Layer 2→3 transition: Jobs reference Plans, don't embed them
+        // Workers will fetch the plan separately using PLAN.GET
+        let job_value = serde_json::json!({
+            "job_id": job_id.clone(),
+            "plan_id": plan_id,
+            "input": input.clone(),
+            "input_index": input_index,
+            "status": "pending",
+            "created_at": get_current_timestamp_secs()?,
+        });
 
         // Serialize Job to JSON
         let job_json = serde_json::to_string(&job_value)
@@ -1640,9 +1663,31 @@ fn handle_action_submit(args: &[RespValue], db: &Database) -> Result<RespValue> 
         let timestamp = get_current_timestamp_secs()?;
         db.hset(&job_key, "created_at", timestamp.to_string().as_bytes())?;
 
+        // Store input data (serialized JSON)
+        let input_json = serde_json::to_string(&input)
+            .map_err(|e| Error::Protocol(format!("Failed to serialize input: {}", e)))?;
+
+        // Security: Validate serialized input size to prevent resource exhaustion
+        // This check is AFTER serialization to catch actual storage size, not just JSON structure
+        if input_json.len() > MAX_INPUT_SIZE {
+            return Err(Error::InvalidArguments(format!(
+                "Serialized input {} exceeds maximum size of {} bytes (got {} bytes)",
+                input_index,
+                MAX_INPUT_SIZE,
+                input_json.len()
+            )));
+        }
+
+        db.hset(&job_key, "input", input_json.as_bytes())?;
+        db.hset(&job_key, "input_index", input_index.to_string().as_bytes())?;
+
         // Index Job by action_id (for querying jobs by action)
         let action_jobs_key = format!("action:{}:jobs", action_id);
         db.lpush(&action_jobs_key, job_id.as_bytes())?;
+
+        // Index Job by plan_id (for querying jobs by plan)
+        let plan_jobs_key = format!("plan:{}:jobs", plan_id);
+        db.lpush(&plan_jobs_key, job_id.as_bytes())?;
 
         job_ids.push(job_id);
     }
@@ -2232,6 +2277,110 @@ fn handle_jobs_list(args: &[RespValue], _db: &Database) -> Result<RespValue> {
 
     debug!("JOBS.LIST -> {} jobs (offset: {}, limit: {})", jobs.len(), offset, limit);
     Ok(RespValue::Array(jobs))
+}
+
+/// Handle JOB.GET command
+///
+/// Returns job metadata including plan_id reference and input data.
+/// Workers use this to retrieve job details after popping from queue.
+///
+/// # Security
+/// - Requires authentication
+/// - Validates job_id format to prevent injection
+///
+/// # Arguments
+/// * `args` - RESP arguments: [command, job_id]
+/// * `db` - Database handle
+///
+/// # Returns
+/// JSON object with job metadata:
+/// ```json
+/// {
+///   "job_id": "job_abc123",
+///   "plan_id": "plan_xyz789",
+///   "input": {...},
+///   "status": "pending",
+///   "created_at": 1234567890
+/// }
+/// ```
+fn handle_job_get(args: &[RespValue], db: &Database) -> Result<RespValue> {
+    // Security: Check rate limit to prevent DoS from malicious/misconfigured workers
+    if JOB_GET_LIMITER.check().is_err() {
+        warn!("JOB.GET rate limit exceeded");
+        return Err(Error::Protocol(
+            "Rate limit exceeded for JOB.GET (max 100/second)".to_string(),
+        ));
+    }
+
+    // Validate arguments
+    if args.len() != 2 {
+        return Err(Error::InvalidArguments(
+            "JOB.GET requires exactly one argument (job_id)".to_string(),
+        ));
+    }
+
+    let job_id = args[1].as_string()?;
+    validate_identifier(&job_id, "job_id")?;
+
+    let job_key = format!("job:{}", job_id);
+
+    // Check if job exists
+    let plan_id_bytes = db.hget(&job_key, "plan_id")?
+        .ok_or_else(|| Error::InvalidArguments(format!("Job not found: {}", job_id)))?;
+
+    let plan_id = String::from_utf8(plan_id_bytes)
+        .map_err(|_| Error::Protocol("Invalid plan_id encoding".to_string()))?;
+
+    // Get job metadata
+    let status_bytes = db.hget(&job_key, "status")?
+        .unwrap_or_else(|| b"unknown".to_vec());
+    let status = String::from_utf8(status_bytes)
+        .map_err(|_| Error::Protocol("Invalid status encoding".to_string()))?;
+
+    let created_at_bytes = db.hget(&job_key, "created_at")?;
+    let created_at = if let Some(bytes) = created_at_bytes {
+        let ts_str = std::str::from_utf8(&bytes)
+            .map_err(|_| Error::Protocol("Invalid timestamp encoding".to_string()))?;
+        ts_str.parse::<u64>()
+            .map_err(|_| Error::Protocol("Invalid timestamp format".to_string()))?
+    } else {
+        0
+    };
+
+    // Get input data (stored as JSON)
+    let input_bytes = db.hget(&job_key, "input")?
+        .unwrap_or_else(|| b"{}".to_vec());
+    let input_str = std::str::from_utf8(&input_bytes)
+        .map_err(|_| Error::Protocol("Invalid input encoding".to_string()))?;
+    let input: serde_json::Value = serde_json::from_str(input_str)
+        .map_err(|_| Error::Protocol("Invalid input JSON".to_string()))?;
+
+    // Get input_index if it exists
+    let input_index = if let Some(bytes) = db.hget(&job_key, "input_index")? {
+        std::str::from_utf8(&bytes).ok()
+            .and_then(|s| s.parse::<u64>().ok())
+    } else {
+        None
+    };
+
+    // Build response
+    let mut response = serde_json::json!({
+        "job_id": job_id,
+        "plan_id": plan_id,
+        "input": input,
+        "status": status,
+        "created_at": created_at,
+    });
+
+    if let Some(idx) = input_index {
+        response["input_index"] = serde_json::Value::Number(idx.into());
+    }
+
+    let response_json = serde_json::to_string(&response)
+        .map_err(|_| Error::Protocol("Failed to serialize response".to_string()))?;
+
+    debug!("JOB.GET {} -> plan_id: {}, status: {}", job_id, plan_id, status);
+    Ok(RespValue::BulkString(response_json.into_bytes()))
 }
 
 /// Handle WORKERS.LIST command
