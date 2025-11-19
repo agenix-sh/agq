@@ -1490,6 +1490,20 @@ static ACTION_SUBMIT_LIMITER: Lazy<
     >,
 > = Lazy::new(|| governor::RateLimiter::direct(Quota::per_minute(NonZeroU32::new(100).unwrap())));
 
+/// Rate limiter for JOB.GET command
+///
+/// # Rate Limit
+/// - 6000 requests/minute globally (100 requests/second)
+/// - Prevents DoS from malicious or misconfigured workers polling repeatedly
+/// - Higher limit than ACTION_SUBMIT as JOB.GET is lightweight (hash lookup only)
+static JOB_GET_LIMITER: Lazy<
+    governor::RateLimiter<
+        governor::state::direct::NotKeyed,
+        governor::state::InMemoryState,
+        governor::clock::DefaultClock,
+    >,
+> = Lazy::new(|| governor::RateLimiter::direct(Quota::per_minute(NonZeroU32::new(6000).unwrap())));
+
 /// Handle ACTION.SUBMIT command (Layer 4 - Action execution)
 ///
 /// Syntax: ACTION.SUBMIT <action_json>
@@ -1652,6 +1666,18 @@ fn handle_action_submit(args: &[RespValue], db: &Database) -> Result<RespValue> 
         // Store input data (serialized JSON)
         let input_json = serde_json::to_string(&input)
             .map_err(|e| Error::Protocol(format!("Failed to serialize input: {}", e)))?;
+
+        // Security: Validate serialized input size to prevent resource exhaustion
+        // This check is AFTER serialization to catch actual storage size, not just JSON structure
+        if input_json.len() > MAX_INPUT_SIZE {
+            return Err(Error::InvalidArguments(format!(
+                "Serialized input {} exceeds maximum size of {} bytes (got {} bytes)",
+                input_index,
+                MAX_INPUT_SIZE,
+                input_json.len()
+            )));
+        }
+
         db.hset(&job_key, "input", input_json.as_bytes())?;
         db.hset(&job_key, "input_index", input_index.to_string().as_bytes())?;
 
@@ -2278,6 +2304,14 @@ fn handle_jobs_list(args: &[RespValue], _db: &Database) -> Result<RespValue> {
 /// }
 /// ```
 fn handle_job_get(args: &[RespValue], db: &Database) -> Result<RespValue> {
+    // Security: Check rate limit to prevent DoS from malicious/misconfigured workers
+    if JOB_GET_LIMITER.check().is_err() {
+        warn!("JOB.GET rate limit exceeded");
+        return Err(Error::Protocol(
+            "Rate limit exceeded for JOB.GET (max 100/second)".to_string(),
+        ));
+    }
+
     // Validate arguments
     if args.len() != 2 {
         return Err(Error::InvalidArguments(
