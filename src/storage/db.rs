@@ -1531,6 +1531,57 @@ impl HashOps for Database {
         debug!("HLEN {} -> {}", key, count);
         Ok(count)
     }
+
+    fn hincrby(&self, key: &str, field: &str, increment: i64) -> Result<i64> {
+        let write_txn = self
+            .db
+            .begin_write()
+            .map_err(|e| Error::Protocol(format!("Failed to begin write transaction: {e}")))?;
+
+        let new_value = {
+            let mut table = write_txn
+                .open_table(HASH_TABLE)
+                .map_err(|e| Error::Protocol(format!("Failed to open hash table: {e}")))?;
+
+            let hash_key = format!("{}:{}", key, field);
+
+            // Get current value (default to 0 if not exists)
+            let current_value: i64 = table
+                .get(hash_key.as_str())
+                .map_err(|e| Error::Protocol(format!("Failed to read hash field: {e}")))?
+                .map(|v| {
+                    let bytes = v.value();
+                    std::str::from_utf8(bytes)
+                        .map_err(|e| Error::Protocol(format!("Invalid UTF-8 in hash field: {e}")))?
+                        .parse::<i64>()
+                        .map_err(|e| {
+                            Error::Protocol(format!("Hash field is not an integer: {e}"))
+                        })
+                })
+                .transpose()?
+                .unwrap_or(0);
+
+            // Calculate new value with overflow check
+            let new_value = current_value
+                .checked_add(increment)
+                .ok_or_else(|| Error::Protocol("Integer overflow in HINCRBY".to_string()))?;
+
+            // Store new value
+            let value_str = new_value.to_string();
+            table
+                .insert(hash_key.as_str(), value_str.as_bytes())
+                .map_err(|e| Error::Protocol(format!("Failed to write hash field: {e}")))?;
+
+            new_value
+        };
+
+        write_txn
+            .commit()
+            .map_err(|e| Error::Protocol(format!("Failed to commit transaction: {e}")))?;
+
+        debug!("HINCRBY {} {} {} -> {}", key, field, increment, new_value);
+        Ok(new_value)
+    }
 }
 
 #[cfg(test)]

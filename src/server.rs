@@ -327,6 +327,12 @@ async fn handle_command(
             }
             handle_hlen(&args, db)
         }
+        "HINCRBY" => {
+            if !*authenticated {
+                return Err(Error::NoAuth);
+            }
+            handle_hincrby(&args, db)
+        }
         "PLAN.SUBMIT" => {
             if !*authenticated {
                 return Err(Error::NoAuth);
@@ -1110,6 +1116,25 @@ fn handle_hlen(args: &[RespValue], db: &Database) -> Result<RespValue> {
     let key = args[1].as_string()?;
     let count = db.hlen(&key)?;
     Ok(RespValue::Integer(count as i64))
+}
+
+fn handle_hincrby(args: &[RespValue], db: &Database) -> Result<RespValue> {
+    if args.len() != 4 {
+        return Err(Error::InvalidArguments(
+            "HINCRBY requires exactly three arguments: key field increment".to_string(),
+        ));
+    }
+
+    let key = args[1].as_string()?;
+    let field = args[2].as_string()?;
+    let increment_str = args[3].as_string()?;
+
+    let increment: i64 = increment_str.parse().map_err(|_| {
+        Error::InvalidArguments("HINCRBY increment must be an integer".to_string())
+    })?;
+
+    let new_value = db.hincrby(&key, &field, increment)?;
+    Ok(RespValue::Integer(new_value))
 }
 
 /// Maximum plan JSON size (1MB)
