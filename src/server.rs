@@ -1586,16 +1586,44 @@ fn handle_action_submit(args: &[RespValue], db: &Database) -> Result<RespValue> 
 
 /// Handle PLAN.LIST command
 ///
-/// Returns list of all stored plans with metadata
-fn handle_plans_list(_args: &[RespValue], db: &Database) -> Result<RespValue> {
-    // Get all plan IDs from the plans:all sorted set (sorted by creation time)
-    let plan_entries = db.zrange("plans:all", 0, -1)?;
+/// Usage: PLAN.LIST [offset] [limit]
+/// - offset: Start index (default: 0)
+/// - limit: Max results (default: 50, max: 100)
+///
+/// Returns list of stored plans with metadata
+fn handle_plans_list(args: &[RespValue], db: &Database) -> Result<RespValue> {
+    const DEFAULT_LIMIT: i64 = 50;
+    const MAX_LIMIT: i64 = 100;
+
+    // Parse optional offset and limit arguments
+    let offset = if args.len() > 1 {
+        args[1].as_string()?.parse::<i64>()
+            .map_err(|_| Error::InvalidArguments("offset must be a non-negative integer".to_string()))?
+    } else {
+        0
+    };
+
+    let limit = if args.len() > 2 {
+        let requested = args[2].as_string()?.parse::<i64>()
+            .map_err(|_| Error::InvalidArguments("limit must be a positive integer".to_string()))?;
+        requested.min(MAX_LIMIT) // Enforce maximum
+    } else {
+        DEFAULT_LIMIT
+    };
+
+    if offset < 0 || limit <= 0 {
+        return Err(Error::InvalidArguments("offset must be >= 0 and limit must be > 0".to_string()));
+    }
+
+    // Get paginated plan IDs from the plans:all sorted set (sorted by creation time)
+    let stop = offset + limit - 1;
+    let plan_entries = db.zrange("plans:all", offset, stop)?;
 
     let mut plans = Vec::new();
 
     for (member, _score) in plan_entries {
         let plan_id = String::from_utf8(member)
-            .map_err(|e| Error::Protocol(format!("Invalid plan_id encoding: {}", e)))?;
+            .map_err(|_| Error::Protocol("Invalid plan_id encoding".to_string()))?;
 
         let plan_key = format!("plan:{}", plan_id);
 
@@ -1606,10 +1634,10 @@ fn handle_plans_list(_args: &[RespValue], db: &Database) -> Result<RespValue> {
         };
 
         let json_str = std::str::from_utf8(&json_bytes)
-            .map_err(|e| Error::Protocol(format!("Plan JSON not UTF-8: {}", e)))?;
+            .map_err(|_| Error::Protocol("Invalid plan JSON encoding".to_string()))?;
 
         let plan_value: serde_json::Value = serde_json::from_str(json_str)
-            .map_err(|e| Error::Protocol(format!("Invalid plan JSON: {}", e)))?;
+            .map_err(|_| Error::Protocol("Invalid plan JSON format".to_string()))?;
 
         // Get task count
         let task_count = plan_value["tasks"]
@@ -1626,9 +1654,9 @@ fn handle_plans_list(_args: &[RespValue], db: &Database) -> Result<RespValue> {
         let created_at_bytes = db.hget(&plan_key, "created_at")?;
         let created_at = if let Some(bytes) = created_at_bytes {
             let ts_str = std::str::from_utf8(&bytes)
-                .map_err(|e| Error::Protocol(format!("created_at not UTF-8: {}", e)))?;
+                .map_err(|_| Error::Protocol("Invalid timestamp encoding".to_string()))?;
             ts_str.parse::<u64>()
-                .map_err(|e| Error::Protocol(format!("created_at not a number: {}", e)))?
+                .map_err(|_| Error::Protocol("Invalid timestamp format".to_string()))?
         } else {
             0
         };
@@ -1670,18 +1698,18 @@ fn handle_plans_get(args: &[RespValue], db: &Database) -> Result<RespValue> {
         .ok_or_else(|| Error::InvalidArguments(format!("Plan not found: {}", plan_id)))?;
 
     let json_str = std::str::from_utf8(&json_bytes)
-        .map_err(|e| Error::Protocol(format!("Plan JSON not UTF-8: {}", e)))?;
+        .map_err(|_| Error::Protocol("Invalid plan JSON encoding".to_string()))?;
 
     let mut plan_value: serde_json::Value = serde_json::from_str(json_str)
-        .map_err(|e| Error::Protocol(format!("Invalid plan JSON: {}", e)))?;
+        .map_err(|_| Error::Protocol("Invalid plan JSON format".to_string()))?;
 
     // Add metadata
     let created_at_bytes = db.hget(&plan_key, "created_at")?;
     if let Some(bytes) = created_at_bytes {
         let ts_str = std::str::from_utf8(&bytes)
-            .map_err(|e| Error::Protocol(format!("created_at not UTF-8: {}", e)))?;
+            .map_err(|_| Error::Protocol("Invalid timestamp encoding".to_string()))?;
         let created_at = ts_str.parse::<u64>()
-            .map_err(|e| Error::Protocol(format!("created_at not a number: {}", e)))?;
+            .map_err(|_| Error::Protocol("Invalid timestamp format".to_string()))?;
 
         plan_value["metadata"] = serde_json::json!({
             "created_at": created_at,
@@ -1714,16 +1742,44 @@ fn handle_actions_list(_args: &[RespValue], _db: &Database) -> Result<RespValue>
 
 /// Handle ACTION.GET command
 ///
-/// Returns action details with job summary
+/// Usage: ACTION.GET <action_id> [job_offset] [job_limit]
+/// - action_id: The action identifier (required)
+/// - job_offset: Start index for job_ids (default: 0)
+/// - job_limit: Max job_ids to return (default: 100, max: 1000)
+///
+/// Returns action details with paginated job list
 fn handle_actions_get(args: &[RespValue], db: &Database) -> Result<RespValue> {
-    if args.len() != 2 {
+    if args.len() < 2 {
         return Err(Error::InvalidArguments(
-            "ACTION.GET requires exactly one argument (action_id)".to_string(),
+            "ACTION.GET requires at least one argument (action_id)".to_string(),
         ));
     }
 
+    const DEFAULT_JOB_LIMIT: i64 = 100;
+    const MAX_JOB_LIMIT: i64 = 1000;
+
     let action_id = args[1].as_string()?;
     validate_identifier(&action_id, "action_id")?;
+
+    // Parse optional job pagination arguments
+    let job_offset = if args.len() > 2 {
+        args[2].as_string()?.parse::<i64>()
+            .map_err(|_| Error::InvalidArguments("job_offset must be a non-negative integer".to_string()))?
+    } else {
+        0
+    };
+
+    let job_limit = if args.len() > 3 {
+        let requested = args[3].as_string()?.parse::<i64>()
+            .map_err(|_| Error::InvalidArguments("job_limit must be a positive integer".to_string()))?;
+        requested.min(MAX_JOB_LIMIT) // Enforce maximum
+    } else {
+        DEFAULT_JOB_LIMIT
+    };
+
+    if job_offset < 0 || job_limit <= 0 {
+        return Err(Error::InvalidArguments("job_offset must be >= 0 and job_limit must be > 0".to_string()));
+    }
 
     let action_key = format!("action:{}", action_id);
 
@@ -1732,38 +1788,42 @@ fn handle_actions_get(args: &[RespValue], db: &Database) -> Result<RespValue> {
         .ok_or_else(|| Error::InvalidArguments(format!("Action not found: {}", action_id)))?;
 
     let plan_id = String::from_utf8(plan_id_bytes)
-        .map_err(|e| Error::Protocol(format!("plan_id not UTF-8: {}", e)))?;
+        .map_err(|_| Error::Protocol("Invalid plan_id encoding".to_string()))?;
 
     let status_bytes = db.hget(&action_key, "status")?
         .unwrap_or_else(|| b"unknown".to_vec());
     let status = String::from_utf8(status_bytes)
-        .map_err(|e| Error::Protocol(format!("status not UTF-8: {}", e)))?;
+        .map_err(|_| Error::Protocol("Invalid status encoding".to_string()))?;
 
     let jobs_created_bytes = db.hget(&action_key, "jobs_created")?
         .unwrap_or_else(|| b"0".to_vec());
     let jobs_created_str = std::str::from_utf8(&jobs_created_bytes)
-        .map_err(|e| Error::Protocol(format!("jobs_created not UTF-8: {}", e)))?;
+        .map_err(|_| Error::Protocol("Invalid jobs_created encoding".to_string()))?;
     let jobs_created = jobs_created_str.parse::<u64>()
-        .map_err(|e| Error::Protocol(format!("jobs_created not a number: {}", e)))?;
+        .map_err(|_| Error::Protocol("Invalid jobs_created format".to_string()))?;
 
     let created_at_bytes = db.hget(&action_key, "created_at")?;
     let created_at = if let Some(bytes) = created_at_bytes {
         let ts_str = std::str::from_utf8(&bytes)
-            .map_err(|e| Error::Protocol(format!("created_at not UTF-8: {}", e)))?;
+            .map_err(|_| Error::Protocol("Invalid timestamp encoding".to_string()))?;
         ts_str.parse::<u64>()
-            .map_err(|e| Error::Protocol(format!("created_at not a number: {}", e)))?
+            .map_err(|_| Error::Protocol("Invalid timestamp format".to_string()))?
     } else {
         0
     };
 
-    // Get job list
+    // Get paginated job list
     let action_jobs_key = format!("action:{}:jobs", action_id);
-    let job_ids_bytes = db.lrange(&action_jobs_key, 0, -1)?;
+    let job_stop = job_offset + job_limit - 1;
+    let job_ids_bytes = db.lrange(&action_jobs_key, job_offset, job_stop)?;
 
-    let job_ids: Vec<String> = job_ids_bytes
-        .into_iter()
-        .filter_map(|bytes| String::from_utf8(bytes).ok())
-        .collect();
+    // Convert job IDs with proper error handling (not silent)
+    let mut job_ids = Vec::new();
+    for bytes in job_ids_bytes {
+        let job_id = String::from_utf8(bytes)
+            .map_err(|_| Error::Protocol("Invalid job_id encoding".to_string()))?;
+        job_ids.push(job_id);
+    }
 
     let response = serde_json::json!({
         "action_id": action_id,
@@ -1771,13 +1831,17 @@ fn handle_actions_get(args: &[RespValue], db: &Database) -> Result<RespValue> {
         "status": status,
         "jobs_total": jobs_created,
         "job_ids": job_ids,
+        "job_ids_offset": job_offset,
+        "job_ids_limit": job_limit,
+        "job_ids_returned": job_ids.len(),
         "created_at": created_at,
     });
 
     let response_json = serde_json::to_string(&response)
         .map_err(|e| Error::Protocol(format!("Failed to serialize response: {}", e)))?;
 
-    debug!("ACTION.GET {} -> {} jobs", action_id, job_ids.len());
+    debug!("ACTION.GET {} -> {}/{} jobs (offset: {}, limit: {})",
+           action_id, job_ids.len(), jobs_created, job_offset, job_limit);
     Ok(RespValue::BulkString(response_json.into_bytes()))
 }
 

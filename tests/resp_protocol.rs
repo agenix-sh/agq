@@ -71,13 +71,22 @@ async fn send_resp_command(stream: &mut TcpStream, command: &[u8]) -> Vec<u8> {
     response
 }
 
-/// Helper to create authenticated connection
+/// Helper to create authenticated connection with retry logic
 async fn setup_authenticated_connection() -> (TcpStream, tokio::task::JoinHandle<()>) {
     let (_handle, port) = start_test_server().await;
 
-    let mut stream = TcpStream::connect(format!("127.0.0.1:{port}"))
-        .await
-        .expect("Failed to connect");
+    // Retry connection with exponential backoff
+    let mut retries = 10;
+    let mut stream = loop {
+        match TcpStream::connect(format!("127.0.0.1:{port}")).await {
+            Ok(s) => break s,
+            Err(e) if retries > 0 => {
+                retries -= 1;
+                tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+            }
+            Err(e) => panic!("Failed to connect after retries: {}", e),
+        }
+    };
 
     // AUTH
     let auth_cmd = b"*2\r\n$4\r\nAUTH\r\n$32\r\ntest_session_key_32_bytes_long!!\r\n";
