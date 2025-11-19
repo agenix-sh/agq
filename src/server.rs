@@ -181,7 +181,7 @@ async fn handle_command(
             if !*authenticated {
                 return Err(Error::NoAuth);
             }
-            handle_ping(&args)
+            handle_ping(&args, db)
         }
         "GET" => {
             if !*authenticated {
@@ -466,20 +466,31 @@ fn handle_auth(
 /// Supports both:
 /// - PING -> +PONG
 /// - PING message -> $7\r\nmessage\r\n (echo)
-fn handle_ping(args: &[RespValue]) -> Result<RespValue> {
+/// Worker heartbeat TTL (5 minutes)
+///
+/// Workers are expected to send heartbeats every 60 seconds.
+/// This 5-minute TTL allows for network issues and temporary disruptions
+/// without immediately marking workers as stale.
+const WORKER_HEARTBEAT_TTL_SECS: u64 = 300;
+
+fn handle_ping(args: &[RespValue], db: &Database) -> Result<RespValue> {
     match args.len() {
         1 => {
             // Simple PING
             Ok(RespValue::SimpleString("PONG".to_string()))
         }
         2 => {
-            // PING with message - echo it back
-            match &args[1] {
-                RespValue::BulkString(msg) => Ok(RespValue::BulkString(msg.clone())),
-                _ => Err(Error::InvalidArguments(
-                    "PING message must be a bulk string".to_string(),
-                )),
-            }
+            // PING with worker_id - treat as heartbeat
+            let worker_id = args[1].as_string()?;
+
+            // Validate worker_id
+            validate_identifier(&worker_id, "worker_id")?;
+
+            // Update worker heartbeat
+            register_worker_heartbeat(db, &worker_id)?;
+
+            // Echo back worker_id (standard PING behavior)
+            Ok(RespValue::BulkString(worker_id.as_bytes().to_vec()))
         }
         _ => Err(Error::InvalidArguments(
             "PING accepts 0 or 1 arguments".to_string(),
@@ -2383,9 +2394,95 @@ fn handle_job_get(args: &[RespValue], db: &Database) -> Result<RespValue> {
     Ok(RespValue::BulkString(response_json.into_bytes()))
 }
 
+/// Register or update worker heartbeat
+///
+/// Creates/updates worker metadata with current timestamp and expiry time.
+///
+/// Storage structure:
+/// - Hash: `worker:<worker_id>` with fields: last_seen, status, expire_at
+/// - Sorted set: `workers:all` indexed by last_seen timestamp (for listing)
+/// - Workers expire after WORKER_HEARTBEAT_TTL_SECS (cleaned up on next WORKERS.LIST)
+///
+/// # Arguments
+/// * `db` - Database handle
+/// * `worker_id` - Worker identifier
+///
+/// # Security
+/// - worker_id is validated before calling (alphanumeric + hyphens/underscores)
+///
+/// # Errors
+/// Returns an error if database operations fail
+fn register_worker_heartbeat(db: &Database, worker_id: &str) -> Result<()> {
+    let worker_key = format!("worker:{}", worker_id);
+    let timestamp = get_current_timestamp_secs()?;
+    let expire_at = timestamp + WORKER_HEARTBEAT_TTL_SECS;
+
+    // Store worker metadata hash
+    db.hset(&worker_key, "last_seen", timestamp.to_string().as_bytes())?;
+    db.hset(&worker_key, "status", b"active")?;
+    db.hset(&worker_key, "expire_at", expire_at.to_string().as_bytes())?;
+
+    // Index worker in sorted set (for WORKERS.LIST)
+    // Score = last_seen timestamp for sorting by activity
+    db.zadd("workers:all", timestamp as f64, worker_id.as_bytes())?;
+
+    debug!(
+        "Worker {} heartbeat registered (expires at {})",
+        worker_id, expire_at
+    );
+
+    Ok(())
+}
+
+/// Clean up expired workers
+///
+/// Removes workers from workers:all sorted set if their expire_at timestamp has passed.
+/// This is called before listing workers to ensure stale workers don't appear.
+///
+/// # Arguments
+/// * `db` - Database handle
+///
+/// # Errors
+/// Returns an error if database operations fail
+fn cleanup_expired_workers(db: &Database) -> Result<()> {
+    let workers = db.zrange("workers:all", 0, -1)?;
+    let current_time = get_current_timestamp_secs()?;
+
+    for (worker_id_bytes, _score) in workers {
+        let worker_id = std::str::from_utf8(&worker_id_bytes)
+            .map_err(|_| Error::Protocol("Invalid worker_id encoding".to_string()))?;
+
+        let worker_key = format!("worker:{}", worker_id);
+
+        // Check expire_at field in worker hash
+        if let Some(expire_at_bytes) = db.hget(&worker_key, "expire_at")? {
+            if let Ok(expire_at_str) = std::str::from_utf8(&expire_at_bytes) {
+                if let Ok(expire_at) = expire_at_str.parse::<u64>() {
+                    if current_time >= expire_at {
+                        // Expired - remove worker
+                        debug!("Removing expired worker: {}", worker_id);
+
+                        db.zrem("workers:all", &worker_id_bytes)?;
+                        db.del(&worker_key)?;
+                    }
+                }
+            }
+        } else {
+            // No expire_at field - remove (corrupted data)
+            debug!("Removing worker with missing expire_at: {}", worker_id);
+            db.zrem("workers:all", &worker_id_bytes)?;
+            db.del(&worker_key)?;
+        }
+    }
+
+    Ok(())
+}
+
 /// Handle WORKERS.LIST command
 ///
-/// Returns array of worker IDs currently registered with AGQ.
+/// Returns array of worker objects with metadata (worker_id, last_seen, status, tools).
+///
+/// Workers are tracked via PING heartbeats and auto-expire after WORKER_HEARTBEAT_TTL_SECS.
 ///
 /// # Security
 /// - Requires authentication
@@ -2394,20 +2491,69 @@ fn handle_job_get(args: &[RespValue], db: &Database) -> Result<RespValue> {
 /// * `args` - RESP arguments: [command]
 /// * `db` - Database handle
 ///
-/// # Note
-/// AGQ doesn't currently track workers (AGW connects directly to pull jobs).
-/// This is a placeholder that returns empty array until worker registration is implemented.
-fn handle_workers_list(_args: &[RespValue], _db: &Database) -> Result<RespValue> {
-    // NOTE: AGQ currently doesn't track workers
-    // Workers connect via BRPOP and don't register themselves
-    // This is a placeholder implementation that returns empty array
-    // TODO(#43): When worker registration is added, implement proper listing
-    // See: https://github.com/agenix-sh/agq/issues/43#future-work
+/// # Returns
+/// Array of worker objects sorted by last_seen (most recent first):
+/// ```json
+/// [
+///   {
+///     "worker_id": "worker_abc123",
+///     "last_seen": 1700000000,
+///     "status": "active",
+///     "tools": "grep,sort,uniq"
+///   }
+/// ]
+/// ```
+fn handle_workers_list(_args: &[RespValue], db: &Database) -> Result<RespValue> {
+    // Clean up expired workers first
+    cleanup_expired_workers(db)?;
 
-    let workers: Vec<RespValue> = Vec::new();
+    // Get all workers from sorted set (sorted by last_seen, descending)
+    let workers = db.zrange("workers:all", 0, -1)?;
 
-    debug!("WORKERS.LIST -> {} workers", workers.len());
-    Ok(RespValue::Array(workers))
+    let mut worker_objects = Vec::new();
+
+    for (worker_id_bytes, _score) in workers.iter().rev() {
+        // Reverse to show most recent first
+        let worker_id = std::str::from_utf8(worker_id_bytes)
+            .map_err(|_| Error::Protocol("Invalid worker_id encoding".to_string()))?;
+
+        let worker_key = format!("worker:{}", worker_id);
+
+        // Get worker metadata
+        let last_seen_bytes = db.hget(&worker_key, "last_seen")?;
+        let status_bytes = db.hget(&worker_key, "status")?;
+
+        if let (Some(last_seen), Some(status)) = (last_seen_bytes, status_bytes) {
+            let last_seen_str = std::str::from_utf8(&last_seen)
+                .map_err(|_| Error::Protocol("Invalid last_seen encoding".to_string()))?;
+            let status_str = std::str::from_utf8(&status)
+                .map_err(|_| Error::Protocol("Invalid status encoding".to_string()))?;
+
+            // Get tools (optional field)
+            let tools_key = format!("worker:{}:tools", worker_id);
+            let tools = db.get(&tools_key)?;
+            let tools_str = tools
+                .as_ref()
+                .and_then(|t| std::str::from_utf8(t).ok())
+                .unwrap_or("");
+
+            // Build worker object as JSON
+            let worker_obj = serde_json::json!({
+                "worker_id": worker_id,
+                "last_seen": last_seen_str.parse::<u64>().unwrap_or(0),
+                "status": status_str,
+                "tools": tools_str
+            });
+
+            let worker_json = serde_json::to_string(&worker_obj)
+                .map_err(|_| Error::Protocol("Failed to serialize worker object".to_string()))?;
+
+            worker_objects.push(RespValue::BulkString(worker_json.into_bytes()));
+        }
+    }
+
+    debug!("WORKERS.LIST -> {} workers", worker_objects.len());
+    Ok(RespValue::Array(worker_objects))
 }
 
 /// Handle QUEUE.STATS command
@@ -2547,34 +2693,43 @@ mod tests {
 
     #[tokio::test]
     async fn test_ping_handler_simple() {
+        let (db, _temp) = test_db();
         let args = vec![RespValue::BulkString(b"PING".to_vec())];
 
-        let result = handle_ping(&args).unwrap();
+        let result = handle_ping(&args, &db).unwrap();
 
         assert_eq!(result, RespValue::SimpleString("PONG".to_string()));
     }
 
     #[tokio::test]
-    async fn test_ping_handler_with_message() {
+    async fn test_ping_handler_with_worker_id() {
+        let (db, _temp) = test_db();
         let args = vec![
             RespValue::BulkString(b"PING".to_vec()),
-            RespValue::BulkString(b"hello".to_vec()),
+            RespValue::BulkString(b"worker_test123".to_vec()),
         ];
 
-        let result = handle_ping(&args).unwrap();
+        let result = handle_ping(&args, &db).unwrap();
 
-        assert_eq!(result, RespValue::BulkString(b"hello".to_vec()));
+        // Should echo back worker_id
+        assert_eq!(result, RespValue::BulkString(b"worker_test123".to_vec()));
+
+        // Verify worker was registered
+        let workers = db.zrange("workers:all", 0, -1).unwrap();
+        assert_eq!(workers.len(), 1);
+        assert_eq!(workers[0].0, b"worker_test123");
     }
 
     #[tokio::test]
     async fn test_ping_handler_too_many_args() {
+        let (db, _temp) = test_db();
         let args = vec![
             RespValue::BulkString(b"PING".to_vec()),
             RespValue::BulkString(b"arg1".to_vec()),
             RespValue::BulkString(b"arg2".to_vec()),
         ];
 
-        let result = handle_ping(&args);
+        let result = handle_ping(&args, &db);
 
         assert!(result.is_err());
     }

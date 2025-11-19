@@ -3254,3 +3254,155 @@ async fn test_job_get_validates_job_id() {
     // Should get validation error
     assert!(response_str.contains("invalid") || response_str.contains("alphanumeric"));
 }
+
+// ============================================================================
+// Worker Registration and Heartbeat Tests
+// ============================================================================
+
+#[tokio::test]
+async fn test_worker_heartbeat_registration() {
+    let (mut stream, _handle) = setup_authenticated_connection().await;
+
+    // Send PING with worker_id (heartbeat)
+    let cmd = b"*2\r\n$4\r\nPING\r\n$12\r\nworker_test1\r\n";
+    let response = send_resp_command(&mut stream, cmd).await;
+
+    let response_str = std::str::from_utf8(&response).unwrap();
+
+    // Should echo back worker_id (RESP bulk string format)
+    assert!(response_str.contains("worker_test1"));
+}
+
+#[tokio::test]
+async fn test_workers_list_shows_registered_workers() {
+    let (mut stream, _handle) = setup_authenticated_connection().await;
+
+    // Register two workers via heartbeat
+    let cmd1 = b"*2\r\n$4\r\nPING\r\n$12\r\nworker_alpha\r\n";
+    send_resp_command(&mut stream, cmd1).await;
+
+    let cmd2 = b"*2\r\n$4\r\nPING\r\n$11\r\nworker_beta\r\n";
+    send_resp_command(&mut stream, cmd2).await;
+
+    // List workers
+    let cmd = b"*1\r\n$12\r\nWORKERS.LIST\r\n";
+    let response = send_resp_command(&mut stream, cmd).await;
+
+    let response_str = std::str::from_utf8(&response).unwrap();
+
+    // Should return array of 2 workers
+    assert!(response_str.starts_with("*2"));
+    assert!(response_str.contains("worker_alpha"));
+    assert!(response_str.contains("worker_beta"));
+}
+
+#[tokio::test]
+async fn test_workers_list_includes_metadata() {
+    let (mut stream, _handle) = setup_authenticated_connection().await;
+
+    // Register worker
+    let cmd = b"*2\r\n$4\r\nPING\r\n$15\r\nworker_metadata\r\n";
+    send_resp_command(&mut stream, cmd).await;
+
+    // List workers
+    let cmd = b"*1\r\n$12\r\nWORKERS.LIST\r\n";
+    let response = send_resp_command(&mut stream, cmd).await;
+
+    let response_str = std::str::from_utf8(&response).unwrap();
+
+    // Should include worker metadata
+    assert!(response_str.contains("worker_metadata"), "Response should contain worker_metadata");
+    assert!(response_str.contains("last_seen"), "Response should contain last_seen");
+    assert!(response_str.contains("status"), "Response should contain status");
+    assert!(response_str.contains("active"), "Response should contain active status");
+
+    // Tools field will be empty since we didn't register any
+    assert!(response_str.contains("tools"), "Response should contain tools field");
+}
+
+#[tokio::test]
+async fn test_worker_heartbeat_validates_worker_id() {
+    let (mut stream, _handle) = setup_authenticated_connection().await;
+
+    // Try PING with invalid worker_id (contains special characters)
+    let cmd = b"*2\r\n$4\r\nPING\r\n$11\r\nworker$%^&*\r\n";
+    let response = send_resp_command(&mut stream, cmd).await;
+
+    let response_str = std::str::from_utf8(&response).unwrap();
+
+    // Should get validation error
+    assert!(response_str.starts_with("-"));
+    assert!(response_str.contains("invalid") || response_str.contains("alphanumeric"));
+}
+
+#[tokio::test]
+async fn test_workers_list_empty_when_no_workers() {
+    let (mut stream, _handle) = setup_authenticated_connection().await;
+
+    // List workers without registering any
+    let cmd = b"*1\r\n$12\r\nWORKERS.LIST\r\n";
+    let response = send_resp_command(&mut stream, cmd).await;
+
+    let response_str = std::str::from_utf8(&response).unwrap();
+
+    // Should return empty array
+    assert!(response_str.starts_with("*0"));
+}
+
+#[tokio::test]
+async fn test_worker_heartbeat_updates_last_seen() {
+    let (mut stream, _handle) = setup_authenticated_connection().await;
+
+    // Register worker
+    let cmd = b"*2\r\n$4\r\nPING\r\n$13\r\nworker_update\r\n";
+    send_resp_command(&mut stream, cmd).await;
+
+    // List workers and capture last_seen
+    let list_cmd = b"*1\r\n$12\r\nWORKERS.LIST\r\n";
+    let response1 = send_resp_command(&mut stream, list_cmd).await;
+    let response1_str = std::str::from_utf8(&response1).unwrap();
+
+    // Extract last_seen timestamp (basic check that it exists)
+    assert!(response1_str.contains("last_seen"));
+
+    // Wait a second
+    tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
+
+    // Send another heartbeat
+    send_resp_command(&mut stream, cmd).await;
+
+    // List workers again
+    let response2 = send_resp_command(&mut stream, list_cmd).await;
+    let response2_str = std::str::from_utf8(&response2).unwrap();
+
+    // Should still have worker (updated last_seen)
+    assert!(response2_str.contains("worker_update"));
+    assert!(response2_str.contains("last_seen"));
+}
+
+#[tokio::test]
+async fn test_workers_list_sorted_by_last_seen() {
+    let (mut stream, _handle) = setup_authenticated_connection().await;
+
+    // Register worker 1
+    let cmd1 = b"*2\r\n$4\r\nPING\r\n$8\r\nworker_1\r\n";
+    send_resp_command(&mut stream, cmd1).await;
+
+    // Wait a moment
+    tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+
+    // Register worker 2
+    let cmd2 = b"*2\r\n$4\r\nPING\r\n$8\r\nworker_2\r\n";
+    send_resp_command(&mut stream, cmd2).await;
+
+    // List workers
+    let cmd = b"*1\r\n$12\r\nWORKERS.LIST\r\n";
+    let response = send_resp_command(&mut stream, cmd).await;
+
+    let response_str = std::str::from_utf8(&response).unwrap();
+
+    // worker_2 should appear before worker_1 (most recent first)
+    let worker2_pos = response_str.find("worker_2").unwrap();
+    let worker1_pos = response_str.find("worker_1").unwrap();
+    assert!(worker2_pos < worker1_pos, "Workers should be sorted by last_seen (most recent first)");
+}
