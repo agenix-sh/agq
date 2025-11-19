@@ -1641,6 +1641,16 @@ fn handle_action_submit(args: &[RespValue], db: &Database) -> Result<RespValue> 
     let timestamp = get_current_timestamp_secs()?;
     db.hset(&action_key, "created_at", timestamp.to_string().as_bytes())?;
 
+    // Initialize job status counters (for efficient ACTION.LIST/GET queries)
+    // All jobs start as pending, will be updated by workers as they complete
+    db.hset(&action_key, "jobs_completed", b"0")?;
+    db.hset(&action_key, "jobs_failed", b"0")?;
+    db.hset(
+        &action_key,
+        "jobs_pending",
+        job_ids.len().to_string().as_bytes(),
+    )?;
+
     // Track plan usage statistics
     let plan_stats_key = format!("plan:{}:stats", plan_id);
     db.hincrby(&plan_stats_key, "total_actions", 1)?;
@@ -1965,39 +1975,42 @@ fn handle_actions_list(args: &[RespValue], db: &Database) -> Result<RespValue> {
             }
         }
 
-        // Calculate job progress
+        // Read cached job status counters (avoids N+1 query problem)
+        // These counters are maintained by ACTION.SUBMIT and updated by workers
+        let jobs_completed = if let Some(bytes) = db.hget(&action_key, "jobs_completed")? {
+            std::str::from_utf8(&bytes).ok()
+                .and_then(|s| s.parse::<i64>().ok())
+                .unwrap_or(0)
+        } else {
+            0
+        };
+
+        let jobs_failed = if let Some(bytes) = db.hget(&action_key, "jobs_failed")? {
+            std::str::from_utf8(&bytes).ok()
+                .and_then(|s| s.parse::<i64>().ok())
+                .unwrap_or(0)
+        } else {
+            0
+        };
+
+        let jobs_pending = if let Some(bytes) = db.hget(&action_key, "jobs_pending")? {
+            std::str::from_utf8(&bytes).ok()
+                .and_then(|s| s.parse::<i64>().ok())
+                .unwrap_or(0)
+        } else {
+            0
+        };
+
+        // Get total job count from list length (more accurate than jobs_created field)
         let action_jobs_key = format!("action:{}:jobs", action_id);
-        let job_ids = db.lrange(&action_jobs_key, 0, -1)?;
-
-        let mut jobs_completed = 0;
-        let mut jobs_failed = 0;
-        let mut jobs_pending = 0;
-
-        for job_id_bytes in &job_ids {
-            let job_id = std::str::from_utf8(job_id_bytes)
-                .map_err(|_| Error::Protocol("Invalid job_id encoding".to_string()))?;
-            let job_key = format!("job:{}", job_id);
-
-            let job_status = if let Some(bytes) = db.hget(&job_key, "status")? {
-                String::from_utf8(bytes)
-                    .unwrap_or_else(|_| "pending".to_string())
-            } else {
-                "pending".to_string()
-            };
-
-            match job_status.as_str() {
-                "completed" => jobs_completed += 1,
-                "failed" => jobs_failed += 1,
-                _ => jobs_pending += 1,
-            }
-        }
+        let jobs_total = db.llen(&action_jobs_key)?;
 
         let action_info = serde_json::json!({
             "action_id": action_id,
             "plan_id": plan_id,
             "status": status,
             "created_at": created_at,
-            "jobs_total": job_ids.len(),
+            "jobs_total": jobs_total,
             "jobs_completed": jobs_completed,
             "jobs_failed": jobs_failed,
             "jobs_pending": jobs_pending,
@@ -2080,33 +2093,35 @@ fn handle_actions_get(args: &[RespValue], db: &Database) -> Result<RespValue> {
         0
     };
 
-    // Get all job IDs to calculate status breakdown
+    // Read cached job status counters (avoids N+1 query problem)
+    // These counters are maintained by ACTION.SUBMIT and updated by workers
+    let jobs_completed = if let Some(bytes) = db.hget(&action_key, "jobs_completed")? {
+        std::str::from_utf8(&bytes).ok()
+            .and_then(|s| s.parse::<u64>().ok())
+            .unwrap_or(0)
+    } else {
+        0
+    };
+
+    let jobs_failed = if let Some(bytes) = db.hget(&action_key, "jobs_failed")? {
+        std::str::from_utf8(&bytes).ok()
+            .and_then(|s| s.parse::<u64>().ok())
+            .unwrap_or(0)
+    } else {
+        0
+    };
+
+    let jobs_pending = if let Some(bytes) = db.hget(&action_key, "jobs_pending")? {
+        std::str::from_utf8(&bytes).ok()
+            .and_then(|s| s.parse::<u64>().ok())
+            .unwrap_or(0)
+    } else {
+        0
+    };
+
+    // Get total job count from list length
     let action_jobs_key = format!("action:{}:jobs", action_id);
-    let all_job_ids_bytes = db.lrange(&action_jobs_key, 0, -1)?;
-
-    // Calculate job status breakdown
-    let mut jobs_completed = 0;
-    let mut jobs_failed = 0;
-    let mut jobs_pending = 0;
-
-    for job_id_bytes in &all_job_ids_bytes {
-        let job_id = std::str::from_utf8(job_id_bytes)
-            .map_err(|_| Error::Protocol("Invalid job_id encoding".to_string()))?;
-        let job_key = format!("job:{}", job_id);
-
-        let job_status = if let Some(bytes) = db.hget(&job_key, "status")? {
-            String::from_utf8(bytes)
-                .unwrap_or_else(|_| "pending".to_string())
-        } else {
-            "pending".to_string()
-        };
-
-        match job_status.as_str() {
-            "completed" => jobs_completed += 1,
-            "failed" => jobs_failed += 1,
-            _ => jobs_pending += 1,
-        }
-    }
+    let jobs_total = db.llen(&action_jobs_key)?;
 
     // Get paginated job list for job_ids array
     // Use checked arithmetic to prevent integer overflow
@@ -2129,7 +2144,7 @@ fn handle_actions_get(args: &[RespValue], db: &Database) -> Result<RespValue> {
         "status": status,
         "created_at": created_at,
         "summary": {
-            "jobs_total": all_job_ids_bytes.len(),
+            "jobs_total": jobs_total,
             "jobs_completed": jobs_completed,
             "jobs_failed": jobs_failed,
             "jobs_pending": jobs_pending,
@@ -2144,7 +2159,7 @@ fn handle_actions_get(args: &[RespValue], db: &Database) -> Result<RespValue> {
         .map_err(|_| Error::Protocol("Failed to serialize response".to_string()))?;
 
     debug!("ACTION.GET {} -> {}/{} jobs (completed: {}, failed: {}, pending: {})",
-           action_id, job_ids.len(), all_job_ids_bytes.len(), jobs_completed, jobs_failed, jobs_pending);
+           action_id, job_ids.len(), jobs_total, jobs_completed, jobs_failed, jobs_pending);
     Ok(RespValue::BulkString(response_json.into_bytes()))
 }
 
