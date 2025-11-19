@@ -333,17 +333,27 @@ async fn handle_command(
             }
             handle_hincrby(&args, db)
         }
-        "PLAN.SUBMIT" => {
+        cmd if cmd.starts_with("PLAN.") => {
             if !*authenticated {
                 return Err(Error::NoAuth);
             }
-            handle_plan_submit(&args, db)
+            match cmd {
+                "PLAN.SUBMIT" => handle_plan_submit(&args, db),
+                "PLAN.LIST" => handle_plans_list(&args, db),
+                "PLAN.GET" => handle_plans_get(&args, db),
+                _ => Err(Error::Protocol(format!("Unknown PLAN command: {}", cmd))),
+            }
         }
-        "ACTION.SUBMIT" => {
+        cmd if cmd.starts_with("ACTION.") => {
             if !*authenticated {
                 return Err(Error::NoAuth);
             }
-            handle_action_submit(&args, db)
+            match cmd {
+                "ACTION.SUBMIT" => handle_action_submit(&args, db),
+                "ACTION.LIST" => handle_actions_list(&args, db),
+                "ACTION.GET" => handle_actions_get(&args, db),
+                _ => Err(Error::Protocol(format!("Unknown ACTION command: {}", cmd))),
+            }
         }
         _ => {
             if !*authenticated {
@@ -1571,6 +1581,203 @@ fn handle_action_submit(args: &[RespValue], db: &Database) -> Result<RespValue> 
         job_ids.len()
     );
 
+    Ok(RespValue::BulkString(response_json.into_bytes()))
+}
+
+/// Handle PLAN.LIST command
+///
+/// Returns list of all stored plans with metadata
+fn handle_plans_list(_args: &[RespValue], db: &Database) -> Result<RespValue> {
+    // Get all plan IDs from the plans:all sorted set (sorted by creation time)
+    let plan_entries = db.zrange("plans:all", 0, -1)?;
+
+    let mut plans = Vec::new();
+
+    for (member, _score) in plan_entries {
+        let plan_id = String::from_utf8(member)
+            .map_err(|e| Error::Protocol(format!("Invalid plan_id encoding: {}", e)))?;
+
+        let plan_key = format!("plan:{}", plan_id);
+
+        // Get plan metadata
+        let json_bytes = match db.hget(&plan_key, "json")? {
+            Some(bytes) => bytes,
+            None => continue, // Plan was deleted, skip
+        };
+
+        let json_str = std::str::from_utf8(&json_bytes)
+            .map_err(|e| Error::Protocol(format!("Plan JSON not UTF-8: {}", e)))?;
+
+        let plan_value: serde_json::Value = serde_json::from_str(json_str)
+            .map_err(|e| Error::Protocol(format!("Invalid plan JSON: {}", e)))?;
+
+        // Get task count
+        let task_count = plan_value["tasks"]
+            .as_array()
+            .map(|tasks| tasks.len())
+            .unwrap_or(0);
+
+        // Get description
+        let description = plan_value["plan_description"]
+            .as_str()
+            .unwrap_or("");
+
+        // Get creation timestamp
+        let created_at_bytes = db.hget(&plan_key, "created_at")?;
+        let created_at = if let Some(bytes) = created_at_bytes {
+            let ts_str = std::str::from_utf8(&bytes)
+                .map_err(|e| Error::Protocol(format!("created_at not UTF-8: {}", e)))?;
+            ts_str.parse::<u64>()
+                .map_err(|e| Error::Protocol(format!("created_at not a number: {}", e)))?
+        } else {
+            0
+        };
+
+        let plan_info = serde_json::json!({
+            "plan_id": plan_id,
+            "plan_description": description,
+            "task_count": task_count,
+            "created_at": created_at,
+        });
+
+        plans.push(plan_info);
+    }
+
+    let response = serde_json::to_string(&plans)
+        .map_err(|e| Error::Protocol(format!("Failed to serialize response: {}", e)))?;
+
+    debug!("PLAN.LIST -> {} plans", plans.len());
+    Ok(RespValue::BulkString(response.into_bytes()))
+}
+
+/// Handle PLAN.GET command
+///
+/// Returns full plan details for a specific plan_id
+fn handle_plans_get(args: &[RespValue], db: &Database) -> Result<RespValue> {
+    if args.len() != 2 {
+        return Err(Error::InvalidArguments(
+            "PLAN.GET requires exactly one argument (plan_id)".to_string(),
+        ));
+    }
+
+    let plan_id = args[1].as_string()?;
+    validate_identifier(&plan_id, "plan_id")?;
+
+    let plan_key = format!("plan:{}", plan_id);
+
+    // Get plan JSON
+    let json_bytes = db.hget(&plan_key, "json")?
+        .ok_or_else(|| Error::InvalidArguments(format!("Plan not found: {}", plan_id)))?;
+
+    let json_str = std::str::from_utf8(&json_bytes)
+        .map_err(|e| Error::Protocol(format!("Plan JSON not UTF-8: {}", e)))?;
+
+    let mut plan_value: serde_json::Value = serde_json::from_str(json_str)
+        .map_err(|e| Error::Protocol(format!("Invalid plan JSON: {}", e)))?;
+
+    // Add metadata
+    let created_at_bytes = db.hget(&plan_key, "created_at")?;
+    if let Some(bytes) = created_at_bytes {
+        let ts_str = std::str::from_utf8(&bytes)
+            .map_err(|e| Error::Protocol(format!("created_at not UTF-8: {}", e)))?;
+        let created_at = ts_str.parse::<u64>()
+            .map_err(|e| Error::Protocol(format!("created_at not a number: {}", e)))?;
+
+        plan_value["metadata"] = serde_json::json!({
+            "created_at": created_at,
+        });
+    }
+
+    let response = serde_json::to_string(&plan_value)
+        .map_err(|e| Error::Protocol(format!("Failed to serialize response: {}", e)))?;
+
+    debug!("PLAN.GET {} -> {} bytes", plan_id, response.len());
+    Ok(RespValue::BulkString(response.into_bytes()))
+}
+
+/// Handle ACTION.LIST command
+///
+/// Returns list of all actions (optionally filtered by status)
+fn handle_actions_list(_args: &[RespValue], _db: &Database) -> Result<RespValue> {
+    // Note: This is a simplified implementation
+    // A production version would need an indexed set of action IDs
+    // For now, we return an empty array as actions aren't indexed yet
+
+    let actions: Vec<serde_json::Value> = Vec::new();
+
+    let response = serde_json::to_string(&actions)
+        .map_err(|e| Error::Protocol(format!("Failed to serialize response: {}", e)))?;
+
+    debug!("ACTION.LIST -> {} actions", actions.len());
+    Ok(RespValue::BulkString(response.into_bytes()))
+}
+
+/// Handle ACTION.GET command
+///
+/// Returns action details with job summary
+fn handle_actions_get(args: &[RespValue], db: &Database) -> Result<RespValue> {
+    if args.len() != 2 {
+        return Err(Error::InvalidArguments(
+            "ACTION.GET requires exactly one argument (action_id)".to_string(),
+        ));
+    }
+
+    let action_id = args[1].as_string()?;
+    validate_identifier(&action_id, "action_id")?;
+
+    let action_key = format!("action:{}", action_id);
+
+    // Get action metadata
+    let plan_id_bytes = db.hget(&action_key, "plan_id")?
+        .ok_or_else(|| Error::InvalidArguments(format!("Action not found: {}", action_id)))?;
+
+    let plan_id = String::from_utf8(plan_id_bytes)
+        .map_err(|e| Error::Protocol(format!("plan_id not UTF-8: {}", e)))?;
+
+    let status_bytes = db.hget(&action_key, "status")?
+        .unwrap_or_else(|| b"unknown".to_vec());
+    let status = String::from_utf8(status_bytes)
+        .map_err(|e| Error::Protocol(format!("status not UTF-8: {}", e)))?;
+
+    let jobs_created_bytes = db.hget(&action_key, "jobs_created")?
+        .unwrap_or_else(|| b"0".to_vec());
+    let jobs_created_str = std::str::from_utf8(&jobs_created_bytes)
+        .map_err(|e| Error::Protocol(format!("jobs_created not UTF-8: {}", e)))?;
+    let jobs_created = jobs_created_str.parse::<u64>()
+        .map_err(|e| Error::Protocol(format!("jobs_created not a number: {}", e)))?;
+
+    let created_at_bytes = db.hget(&action_key, "created_at")?;
+    let created_at = if let Some(bytes) = created_at_bytes {
+        let ts_str = std::str::from_utf8(&bytes)
+            .map_err(|e| Error::Protocol(format!("created_at not UTF-8: {}", e)))?;
+        ts_str.parse::<u64>()
+            .map_err(|e| Error::Protocol(format!("created_at not a number: {}", e)))?
+    } else {
+        0
+    };
+
+    // Get job list
+    let action_jobs_key = format!("action:{}:jobs", action_id);
+    let job_ids_bytes = db.lrange(&action_jobs_key, 0, -1)?;
+
+    let job_ids: Vec<String> = job_ids_bytes
+        .into_iter()
+        .filter_map(|bytes| String::from_utf8(bytes).ok())
+        .collect();
+
+    let response = serde_json::json!({
+        "action_id": action_id,
+        "plan_id": plan_id,
+        "status": status,
+        "jobs_total": jobs_created,
+        "job_ids": job_ids,
+        "created_at": created_at,
+    });
+
+    let response_json = serde_json::to_string(&response)
+        .map_err(|e| Error::Protocol(format!("Failed to serialize response: {}", e)))?;
+
+    debug!("ACTION.GET {} -> {} jobs", action_id, job_ids.len());
     Ok(RespValue::BulkString(response_json.into_bytes()))
 }
 

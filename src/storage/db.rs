@@ -2620,6 +2620,58 @@ mod tests {
     }
 
     #[test]
+    fn test_hincrby() {
+        let (db, _temp) = test_db();
+
+        // Increment non-existent field (starts at 0)
+        let result = db.hincrby("stats:plan_abc", "total_actions", 1).unwrap();
+        assert_eq!(result, 1);
+
+        // Increment again
+        let result = db.hincrby("stats:plan_abc", "total_actions", 1).unwrap();
+        assert_eq!(result, 2);
+
+        // Increment by larger amount
+        let result = db.hincrby("stats:plan_abc", "total_actions", 10).unwrap();
+        assert_eq!(result, 12);
+
+        // Decrement (negative increment)
+        let result = db.hincrby("stats:plan_abc", "total_actions", -5).unwrap();
+        assert_eq!(result, 7);
+
+        // Verify the value is stored correctly
+        let value = db.hget("stats:plan_abc", "total_actions").unwrap().unwrap();
+        assert_eq!(std::str::from_utf8(&value).unwrap(), "7");
+    }
+
+    #[test]
+    fn test_hincrby_separate_fields() {
+        let (db, _temp) = test_db();
+
+        // Different fields in same hash should be independent
+        db.hincrby("stats:plan_abc", "total_actions", 5).unwrap();
+        db.hincrby("stats:plan_abc", "failed_count", 2).unwrap();
+
+        let actions = db.hincrby("stats:plan_abc", "total_actions", 0).unwrap();
+        let failures = db.hincrby("stats:plan_abc", "failed_count", 0).unwrap();
+
+        assert_eq!(actions, 5);
+        assert_eq!(failures, 2);
+    }
+
+    #[test]
+    fn test_hincrby_non_integer_error() {
+        let (db, _temp) = test_db();
+
+        // Set a non-integer value
+        db.hset("stats:plan_abc", "description", b"not a number").unwrap();
+
+        // Try to increment it - should fail
+        let result = db.hincrby("stats:plan_abc", "description", 1);
+        assert!(result.is_err());
+    }
+
+    #[test]
     fn test_hgetall() {
         let (db, _temp) = test_db();
 
