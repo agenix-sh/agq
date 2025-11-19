@@ -1071,25 +1071,21 @@ impl ListOps for Database {
                 .open_table(LIST_DATA_TABLE)
                 .map_err(|e| Error::Protocol(format!("Failed to open list data table: {e}")))?;
 
-            // Get current head/tail
+            // Get current head/tail, or return 0 if list doesn't exist or is empty
             let (head, tail) = match meta_table.get(key) {
                 Ok(Some(meta)) => decode_list_meta(meta.value())?,
                 Ok(None) => {
-                    // List doesn't exist - return early without removing anything
-                    drop(meta_table);
-                    drop(data_table);
-                    0 // Will be returned after transaction commit
+                    // List doesn't exist - return 0 removed count
+                    (0, -1) // Empty list markers (head > tail)
                 }
                 Err(e) => {
                     return Err(Error::Protocol(format!("Failed to get list metadata: {e}")))
                 }
             };
 
-            // If list is empty
+            // If list is empty, return 0
             if head > tail {
-                drop(meta_table);
-                drop(data_table);
-                0 // Will be returned after transaction commit
+                0 // No elements to remove
             } else {
                 // Collect elements and their indices, with capacity pre-allocation
                 let list_size = (tail - head + 1) as usize;
