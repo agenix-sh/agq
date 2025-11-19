@@ -1612,7 +1612,10 @@ async fn test_lrem_nonexistent_key() {
     // LREM on non-existent key should return 0
     let lrem_cmd = b"*4\r\n$4\r\nLREM\r\n$11\r\nnonexistent\r\n$1\r\n1\r\n$1\r\na\r\n";
     let response = send_resp_command(&mut stream, lrem_cmd).await;
-    assert_eq!(&response, b":0\r\n", "LREM on nonexistent key should return 0");
+    assert_eq!(
+        &response, b":0\r\n",
+        "LREM on nonexistent key should return 0"
+    );
 }
 
 #[tokio::test]
@@ -1629,7 +1632,10 @@ async fn test_lrem_invalid_args() {
     // LREM with only 2 arguments (should fail)
     let lrem_cmd = b"*3\r\n$4\r\nLREM\r\n$4\r\nlist\r\n$1\r\n1\r\n";
     let response = send_resp_command(&mut stream, lrem_cmd).await;
-    assert!(response.starts_with(b"-ERR"), "LREM with wrong args should error");
+    assert!(
+        response.starts_with(b"-ERR"),
+        "LREM with wrong args should error"
+    );
 }
 
 #[tokio::test]
@@ -1646,7 +1652,10 @@ async fn test_lrem_invalid_count() {
     // LREM with non-integer count
     let lrem_cmd = b"*4\r\n$4\r\nLREM\r\n$4\r\nlist\r\n$3\r\nabc\r\n$1\r\na\r\n";
     let response = send_resp_command(&mut stream, lrem_cmd).await;
-    assert!(response.starts_with(b"-ERR"), "LREM with invalid count should error");
+    assert!(
+        response.starts_with(b"-ERR"),
+        "LREM with invalid count should error"
+    );
 }
 
 #[tokio::test]
@@ -1661,7 +1670,10 @@ async fn test_lrem_requires_auth() {
     let response = send_resp_command(&mut stream, lrem_cmd).await;
     assert!(response.starts_with(b"-"), "LREM without auth should error");
     let error_msg = std::str::from_utf8(&response).unwrap();
-    assert!(error_msg.contains("NOAUTH"), "Should require authentication");
+    assert!(
+        error_msg.contains("NOAUTH"),
+        "Should require authentication"
+    );
 }
 
 #[tokio::test]
@@ -2710,7 +2722,8 @@ async fn test_hincrby_increment() {
     send_resp_command(&mut stream, auth_cmd).await;
 
     // Increment a counter (starts at 0)
-    let cmd = b"*4\r\n$7\r\nHINCRBY\r\n$15\r\nstats:plan_test\r\n$13\r\ntotal_actions\r\n$1\r\n1\r\n";
+    let cmd =
+        b"*4\r\n$7\r\nHINCRBY\r\n$15\r\nstats:plan_test\r\n$13\r\ntotal_actions\r\n$1\r\n1\r\n";
     let response = send_resp_command(&mut stream, cmd).await;
     assert_eq!(response, b":1\r\n");
 
@@ -2719,8 +2732,7 @@ async fn test_hincrby_increment() {
     assert_eq!(response, b":2\r\n");
 
     // Verify value with HGET
-    let get_cmd =
-        b"*3\r\n$4\r\nHGET\r\n$15\r\nstats:plan_test\r\n$13\r\ntotal_actions\r\n";
+    let get_cmd = b"*3\r\n$4\r\nHGET\r\n$15\r\nstats:plan_test\r\n$13\r\ntotal_actions\r\n";
     let response = send_resp_command(&mut stream, get_cmd).await;
     assert_eq!(response, b"$1\r\n2\r\n");
 }
@@ -2855,7 +2867,8 @@ async fn test_action_get() {
     let (mut stream, _handle) = setup_authenticated_connection().await;
 
     // Submit a plan first
-    let plan_json = r#"{"plan_id":"plan_action_test","tasks":[{"task_number":1,"command":"echo"}]}"#;
+    let plan_json =
+        r#"{"plan_id":"plan_action_test","tasks":[{"task_number":1,"command":"echo"}]}"#;
     let submit_cmd = format!(
         "*2\r\n$11\r\nPLAN.SUBMIT\r\n${}\r\n{}\r\n",
         plan_json.len(),
@@ -2864,8 +2877,7 @@ async fn test_action_get() {
     send_resp_command(&mut stream, submit_cmd.as_bytes()).await;
 
     // Submit an action
-    let action_json =
-        r#"{"action_id":"action_get_test","plan_id":"plan_action_test","inputs":[{"file":"test.txt"}]}"#;
+    let action_json = r#"{"action_id":"action_get_test","plan_id":"plan_action_test","inputs":[{"file":"test.txt"}]}"#;
     let action_cmd = format!(
         "*2\r\n$13\r\nACTION.SUBMIT\r\n${}\r\n{}\r\n",
         action_json.len(),
