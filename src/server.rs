@@ -1374,8 +1374,14 @@ fn handle_plan_submit(args: &[RespValue], db: &Database) -> Result<RespValue> {
         )));
     }
 
-    // Generate unique plan ID
-    let plan_id = format!("plan_{}", Uuid::new_v4().simple());
+    // Extract plan_id from JSON (required by schema)
+    let plan_id = plan_value["plan_id"]
+        .as_str()
+        .ok_or_else(|| Error::InvalidArguments("plan_id field is required".to_string()))?
+        .to_string();
+
+    // Validate plan_id format
+    validate_identifier(&plan_id, "plan_id")?;
 
     // Create internal job
     let internal_job = InternalJob {
@@ -1635,6 +1641,16 @@ fn handle_action_submit(args: &[RespValue], db: &Database) -> Result<RespValue> 
     let timestamp = get_current_timestamp_secs()?;
     db.hset(&action_key, "created_at", timestamp.to_string().as_bytes())?;
 
+    // Track plan usage statistics
+    let plan_stats_key = format!("plan:{}:stats", plan_id);
+    db.hincrby(&plan_stats_key, "total_actions", 1)?;
+    db.hincrby(&plan_stats_key, "total_jobs", job_ids.len() as i64)?;
+    db.hset(&plan_stats_key, "last_used", timestamp.to_string().as_bytes())?;
+
+    // Index action by plan_id (for querying actions by plan)
+    let plan_actions_key = format!("plan:{}:actions", plan_id);
+    db.lpush(&plan_actions_key, action_id.as_bytes())?;
+
     // Build response JSON
     let response = serde_json::json!({
         "action_id": action_id,
@@ -1731,11 +1747,41 @@ fn handle_plans_list(args: &[RespValue], db: &Database) -> Result<RespValue> {
             0
         };
 
+        // Get usage statistics
+        let plan_stats_key = format!("plan:{}:stats", plan_id);
+
+        let total_actions = if let Some(bytes) = db.hget(&plan_stats_key, "total_actions")? {
+            std::str::from_utf8(&bytes).ok()
+                .and_then(|s| s.parse::<i64>().ok())
+                .unwrap_or(0)
+        } else {
+            0
+        };
+
+        let total_jobs = if let Some(bytes) = db.hget(&plan_stats_key, "total_jobs")? {
+            std::str::from_utf8(&bytes).ok()
+                .and_then(|s| s.parse::<i64>().ok())
+                .unwrap_or(0)
+        } else {
+            0
+        };
+
+        let last_used = if let Some(bytes) = db.hget(&plan_stats_key, "last_used")? {
+            std::str::from_utf8(&bytes).ok()
+                .and_then(|s| s.parse::<u64>().ok())
+                .unwrap_or(0)
+        } else {
+            0
+        };
+
         let plan_info = serde_json::json!({
             "plan_id": plan_id,
             "plan_description": description,
             "task_count": task_count,
             "created_at": created_at,
+            "total_actions": total_actions,
+            "total_jobs": total_jobs,
+            "last_used": last_used,
         });
 
         plans.push(plan_info);
@@ -1781,8 +1827,38 @@ fn handle_plans_get(args: &[RespValue], db: &Database) -> Result<RespValue> {
         let created_at = ts_str.parse::<u64>()
             .map_err(|_| Error::Protocol("Invalid timestamp format".to_string()))?;
 
+        // Get usage statistics
+        let plan_stats_key = format!("plan:{}:stats", plan_id);
+
+        let total_actions = if let Some(bytes) = db.hget(&plan_stats_key, "total_actions")? {
+            std::str::from_utf8(&bytes).ok()
+                .and_then(|s| s.parse::<i64>().ok())
+                .unwrap_or(0)
+        } else {
+            0
+        };
+
+        let total_jobs = if let Some(bytes) = db.hget(&plan_stats_key, "total_jobs")? {
+            std::str::from_utf8(&bytes).ok()
+                .and_then(|s| s.parse::<i64>().ok())
+                .unwrap_or(0)
+        } else {
+            0
+        };
+
+        let last_used = if let Some(bytes) = db.hget(&plan_stats_key, "last_used")? {
+            std::str::from_utf8(&bytes).ok()
+                .and_then(|s| s.parse::<u64>().ok())
+                .unwrap_or(0)
+        } else {
+            0
+        };
+
         plan_value["metadata"] = serde_json::json!({
             "created_at": created_at,
+            "total_actions": total_actions,
+            "total_jobs": total_jobs,
+            "last_used": last_used,
         });
     }
 
@@ -1795,13 +1871,137 @@ fn handle_plans_get(args: &[RespValue], db: &Database) -> Result<RespValue> {
 
 /// Handle ACTION.LIST command
 ///
-/// Returns list of all actions (optionally filtered by status)
-fn handle_actions_list(_args: &[RespValue], _db: &Database) -> Result<RespValue> {
-    // Note: This is a simplified implementation
-    // A production version would need an indexed set of action IDs
-    // For now, we return an empty array as actions aren't indexed yet
+/// Usage: ACTION.LIST [status] [offset] [limit]
+/// - status: Optional status filter (pending/running/completed/failed)
+/// - offset: Start index (default: 0)
+/// - limit: Max actions to return (default: 100, max: 1000)
+///
+/// Returns list of all actions (optionally filtered by status) with job progress
+fn handle_actions_list(args: &[RespValue], db: &Database) -> Result<RespValue> {
+    const DEFAULT_LIMIT: i64 = 100;
+    const MAX_LIMIT: i64 = 1000;
 
-    let actions: Vec<serde_json::Value> = Vec::new();
+    // Parse optional status filter
+    let status_filter = if args.len() > 1 {
+        let status = args[1].as_string()?;
+        if !status.is_empty() && status != "all" {
+            // Validate status value
+            if !["pending", "running", "completed", "failed"].contains(&status.as_str()) {
+                return Err(Error::InvalidArguments(
+                    "status must be one of: pending, running, completed, failed, all".to_string(),
+                ));
+            }
+            Some(status)
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+
+    // Parse pagination arguments
+    let offset = if args.len() > 2 {
+        args[2].as_string()?.parse::<i64>()
+            .map_err(|_| Error::InvalidArguments("offset must be a non-negative integer".to_string()))?
+    } else {
+        0
+    };
+
+    let limit = if args.len() > 3 {
+        let requested = args[3].as_string()?.parse::<i64>()
+            .map_err(|_| Error::InvalidArguments("limit must be a positive integer".to_string()))?;
+        requested.min(MAX_LIMIT)
+    } else {
+        DEFAULT_LIMIT
+    };
+
+    if offset < 0 {
+        return Err(Error::InvalidArguments("offset must be non-negative".to_string()));
+    }
+
+    if limit <= 0 {
+        return Err(Error::InvalidArguments("limit must be positive".to_string()));
+    }
+
+    // Get all actions from the sorted set (indexed by timestamp)
+    // Use checked arithmetic to prevent overflow
+    let stop = offset.checked_add(limit)
+        .and_then(|sum| sum.checked_sub(1))
+        .ok_or_else(|| Error::InvalidArguments("Pagination range overflow".to_string()))?;
+
+    let action_entries = db.zrange("actions:all", offset, stop)?;
+
+    let mut actions: Vec<serde_json::Value> = Vec::new();
+
+    for (action_id_bytes, _score) in action_entries {
+        let action_id = std::str::from_utf8(&action_id_bytes)
+            .map_err(|_| Error::Protocol("Invalid action_id encoding".to_string()))?;
+
+        let action_key = format!("action:{}", action_id);
+
+        // Get action metadata
+        let plan_id = db.hget(&action_key, "plan_id")?
+            .and_then(|bytes| std::str::from_utf8(&bytes).ok().map(|s| s.to_string()));
+
+        let status = db.hget(&action_key, "status")?
+            .and_then(|bytes| std::str::from_utf8(&bytes).ok().map(|s| s.to_string()))
+            .unwrap_or_else(|| "pending".to_string());
+
+        let created_at = if let Some(bytes) = db.hget(&action_key, "created_at")? {
+            std::str::from_utf8(&bytes).ok()
+                .and_then(|s| s.parse::<u64>().ok())
+                .unwrap_or(0)
+        } else {
+            0
+        };
+
+        // Apply status filter
+        if let Some(ref filter_status) = status_filter {
+            if &status != filter_status {
+                continue; // Skip actions that don't match filter
+            }
+        }
+
+        // Calculate job progress
+        let action_jobs_key = format!("action:{}:jobs", action_id);
+        let job_ids = db.lrange(&action_jobs_key, 0, -1)?;
+
+        let mut jobs_completed = 0;
+        let mut jobs_failed = 0;
+        let mut jobs_pending = 0;
+
+        for job_id_bytes in &job_ids {
+            let job_id = std::str::from_utf8(job_id_bytes)
+                .map_err(|_| Error::Protocol("Invalid job_id encoding".to_string()))?;
+            let job_key = format!("job:{}", job_id);
+
+            let job_status = if let Some(bytes) = db.hget(&job_key, "status")? {
+                String::from_utf8(bytes)
+                    .unwrap_or_else(|_| "pending".to_string())
+            } else {
+                "pending".to_string()
+            };
+
+            match job_status.as_str() {
+                "completed" => jobs_completed += 1,
+                "failed" => jobs_failed += 1,
+                _ => jobs_pending += 1,
+            }
+        }
+
+        let action_info = serde_json::json!({
+            "action_id": action_id,
+            "plan_id": plan_id,
+            "status": status,
+            "created_at": created_at,
+            "jobs_total": job_ids.len(),
+            "jobs_completed": jobs_completed,
+            "jobs_failed": jobs_failed,
+            "jobs_pending": jobs_pending,
+        });
+
+        actions.push(action_info);
+    }
 
     let response = serde_json::to_string(&actions)
         .map_err(|_| Error::Protocol("Failed to serialize response".to_string()))?;
@@ -1865,12 +2065,7 @@ fn handle_actions_get(args: &[RespValue], db: &Database) -> Result<RespValue> {
     let status = String::from_utf8(status_bytes)
         .map_err(|_| Error::Protocol("Invalid status encoding".to_string()))?;
 
-    let jobs_created_bytes = db.hget(&action_key, "jobs_created")?
-        .unwrap_or_else(|| b"0".to_vec());
-    let jobs_created_str = std::str::from_utf8(&jobs_created_bytes)
-        .map_err(|_| Error::Protocol("Invalid jobs_created encoding".to_string()))?;
-    let jobs_created = jobs_created_str.parse::<u64>()
-        .map_err(|_| Error::Protocol("Invalid jobs_created format".to_string()))?;
+    // Note: We calculate actual job counts from the jobs list, not from jobs_created field
 
     let created_at_bytes = db.hget(&action_key, "created_at")?;
     let created_at = if let Some(bytes) = created_at_bytes {
@@ -1882,9 +2077,36 @@ fn handle_actions_get(args: &[RespValue], db: &Database) -> Result<RespValue> {
         0
     };
 
-    // Get paginated job list
-    // Use checked arithmetic to prevent integer overflow
+    // Get all job IDs to calculate status breakdown
     let action_jobs_key = format!("action:{}:jobs", action_id);
+    let all_job_ids_bytes = db.lrange(&action_jobs_key, 0, -1)?;
+
+    // Calculate job status breakdown
+    let mut jobs_completed = 0;
+    let mut jobs_failed = 0;
+    let mut jobs_pending = 0;
+
+    for job_id_bytes in &all_job_ids_bytes {
+        let job_id = std::str::from_utf8(job_id_bytes)
+            .map_err(|_| Error::Protocol("Invalid job_id encoding".to_string()))?;
+        let job_key = format!("job:{}", job_id);
+
+        let job_status = if let Some(bytes) = db.hget(&job_key, "status")? {
+            String::from_utf8(bytes)
+                .unwrap_or_else(|_| "pending".to_string())
+        } else {
+            "pending".to_string()
+        };
+
+        match job_status.as_str() {
+            "completed" => jobs_completed += 1,
+            "failed" => jobs_failed += 1,
+            _ => jobs_pending += 1,
+        }
+    }
+
+    // Get paginated job list for job_ids array
+    // Use checked arithmetic to prevent integer overflow
     let job_stop = job_offset.checked_add(job_limit)
         .and_then(|sum| sum.checked_sub(1))
         .ok_or_else(|| Error::InvalidArguments("Job pagination range overflow".to_string()))?;
@@ -1902,19 +2124,24 @@ fn handle_actions_get(args: &[RespValue], db: &Database) -> Result<RespValue> {
         "action_id": action_id,
         "plan_id": plan_id,
         "status": status,
-        "jobs_total": jobs_created,
+        "created_at": created_at,
+        "summary": {
+            "jobs_total": all_job_ids_bytes.len(),
+            "jobs_completed": jobs_completed,
+            "jobs_failed": jobs_failed,
+            "jobs_pending": jobs_pending,
+        },
         "job_ids": job_ids,
         "job_ids_offset": job_offset,
         "job_ids_limit": job_limit,
         "job_ids_returned": job_ids.len(),
-        "created_at": created_at,
     });
 
     let response_json = serde_json::to_string(&response)
         .map_err(|_| Error::Protocol("Failed to serialize response".to_string()))?;
 
-    debug!("ACTION.GET {} -> {}/{} jobs (offset: {}, limit: {})",
-           action_id, job_ids.len(), jobs_created, job_offset, job_limit);
+    debug!("ACTION.GET {} -> {}/{} jobs (completed: {}, failed: {}, pending: {})",
+           action_id, job_ids.len(), all_job_ids_bytes.len(), jobs_completed, jobs_failed, jobs_pending);
     Ok(RespValue::BulkString(response_json.into_bytes()))
 }
 
