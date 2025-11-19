@@ -1651,6 +1651,9 @@ fn handle_action_submit(args: &[RespValue], db: &Database) -> Result<RespValue> 
     let plan_actions_key = format!("plan:{}:actions", plan_id);
     db.lpush(&plan_actions_key, action_id.as_bytes())?;
 
+    // Index action in global sorted set (for ACTION.LIST)
+    db.zadd("actions:all", timestamp as f64, action_id.as_bytes())?;
+
     // Build response JSON
     let response = serde_json::json!({
         "action_id": action_id,

@@ -2915,7 +2915,42 @@ async fn test_action_list_empty() {
     let cmd = b"*1\r\n$11\r\nACTION.LIST\r\n";
     let response = send_resp_command(&mut stream, cmd).await;
 
-    // Should return empty JSON array (ACTION.LIST not fully implemented yet)
+    // Should return empty JSON array
     let response_str = std::str::from_utf8(&response).unwrap();
     assert!(response_str.contains("[]"));
+}
+
+#[tokio::test]
+async fn test_action_list_with_actions() {
+    let (mut stream, _handle) = setup_authenticated_connection().await;
+
+    // Submit a plan first
+    let plan_json = r#"{"plan_id":"plan_list_actions_test","plan_description":"Test plan","tasks":[{"task_number":1,"command":"echo test"}]}"#;
+    let submit_cmd = format!(
+        "*2\r\n$11\r\nPLAN.SUBMIT\r\n${}\r\n{}\r\n",
+        plan_json.len(),
+        plan_json
+    );
+    send_resp_command(&mut stream, submit_cmd.as_bytes()).await;
+
+    // Submit an action
+    let action_json = r#"{"action_id":"action_list_test","plan_id":"plan_list_actions_test","inputs":[{"input_id":"input1","data":"test"}]}"#;
+    let action_cmd = format!(
+        "*2\r\n$13\r\nACTION.SUBMIT\r\n${}\r\n{}\r\n",
+        action_json.len(),
+        action_json
+    );
+    send_resp_command(&mut stream, action_cmd.as_bytes()).await;
+
+    // List all actions
+    let cmd = b"*1\r\n$11\r\nACTION.LIST\r\n";
+    let response = send_resp_command(&mut stream, cmd).await;
+
+    let response_str = std::str::from_utf8(&response).unwrap();
+    assert!(response_str.contains("action_list_test"));
+    assert!(response_str.contains("plan_list_actions_test"));
+    assert!(response_str.contains("jobs_total"));
+    assert!(response_str.contains("jobs_completed"));
+    assert!(response_str.contains("jobs_failed"));
+    assert!(response_str.contains("jobs_pending"));
 }
