@@ -3092,3 +3092,73 @@ async fn test_queue_stats_with_jobs() {
     // We should see at least 4 elements (2 fields × 2 values)
     assert!(response_str.starts_with("*4"));
 }
+
+/// Test JOBS.LIST edge cases - input validation
+#[tokio::test]
+async fn test_jobs_list_negative_offset() {
+    let (mut stream, _handle) = setup_authenticated_connection().await;
+
+    // Try JOBS.LIST with negative offset (should be rejected by u64 parsing)
+    let cmd = b"*3\r\n$9\r\nJOBS.LIST\r\n$2\r\n-1\r\n$2\r\n10\r\n";
+    let response = send_resp_command(&mut stream, cmd).await;
+
+    let response_str = std::str::from_utf8(&response).unwrap();
+    // Should get error about invalid offset
+    assert!(response_str.starts_with("-") || response_str.contains("ERR"));
+}
+
+#[tokio::test]
+async fn test_jobs_list_zero_limit() {
+    let (mut stream, _handle) = setup_authenticated_connection().await;
+
+    // Try JOBS.LIST with limit = 0 (should be rejected)
+    let cmd = b"*3\r\n$9\r\nJOBS.LIST\r\n$1\r\n0\r\n$1\r\n0\r\n";
+    let response = send_resp_command(&mut stream, cmd).await;
+
+    let response_str = std::str::from_utf8(&response).unwrap();
+    // Should get error about limit must be > 0
+    assert!(response_str.starts_with("-"));
+    assert!(response_str.contains("limit must be > 0"));
+}
+
+#[tokio::test]
+async fn test_jobs_list_limit_capped_at_max() {
+    let (mut stream, _handle) = setup_authenticated_connection().await;
+
+    // Try JOBS.LIST with limit > MAX_LIMIT (1000)
+    // Should be capped at 1000, not rejected
+    let cmd = b"*3\r\n$9\r\nJOBS.LIST\r\n$1\r\n0\r\n$4\r\n9999\r\n";
+    let response = send_resp_command(&mut stream, cmd).await;
+
+    let response_str = std::str::from_utf8(&response).unwrap();
+    // Should succeed (capped at max, but still returns empty array)
+    assert!(response_str.starts_with("*0") || response_str == "*0\r\n");
+}
+
+#[tokio::test]
+async fn test_jobs_list_malformed_offset() {
+    let (mut stream, _handle) = setup_authenticated_connection().await;
+
+    // Try JOBS.LIST with non-numeric offset
+    let cmd = b"*3\r\n$9\r\nJOBS.LIST\r\n$3\r\nabc\r\n$2\r\n10\r\n";
+    let response = send_resp_command(&mut stream, cmd).await;
+
+    let response_str = std::str::from_utf8(&response).unwrap();
+    // Should get parse error
+    assert!(response_str.starts_with("-"));
+    assert!(response_str.contains("non-negative integer"));
+}
+
+#[tokio::test]
+async fn test_jobs_list_malformed_limit() {
+    let (mut stream, _handle) = setup_authenticated_connection().await;
+
+    // Try JOBS.LIST with non-numeric limit
+    let cmd = b"*3\r\n$9\r\nJOBS.LIST\r\n$1\r\n0\r\n$3\r\nxyz\r\n";
+    let response = send_resp_command(&mut stream, cmd).await;
+
+    let response_str = std::str::from_utf8(&response).unwrap();
+    // Should get parse error
+    assert!(response_str.starts_with("-"));
+    assert!(response_str.contains("positive integer"));
+}

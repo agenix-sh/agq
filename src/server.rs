@@ -2199,33 +2199,34 @@ fn handle_actions_get(args: &[RespValue], db: &Database) -> Result<RespValue> {
 /// will need to be enhanced when such an index is added. For now, it returns
 /// an empty array as a placeholder.
 fn handle_jobs_list(args: &[RespValue], _db: &Database) -> Result<RespValue> {
-    const DEFAULT_LIMIT: i64 = 100;
-    const MAX_LIMIT: i64 = 1000;
+    const DEFAULT_LIMIT: u64 = 100;
+    const MAX_LIMIT: u64 = 1000;
 
     // Parse optional offset and limit arguments
+    // Using u64 enforces non-negativity at type level
     let offset = if args.len() > 1 {
-        args[1].as_string()?.parse::<i64>()
+        args[1].as_string()?.parse::<u64>()
             .map_err(|_| Error::InvalidArguments("offset must be a non-negative integer".to_string()))?
     } else {
         0
     };
 
     let limit = if args.len() > 2 {
-        let requested = args[2].as_string()?.parse::<i64>()
+        let requested = args[2].as_string()?.parse::<u64>()
             .map_err(|_| Error::InvalidArguments("limit must be a positive integer".to_string()))?;
+        if requested == 0 {
+            return Err(Error::InvalidArguments("limit must be > 0".to_string()));
+        }
         requested.min(MAX_LIMIT) // Enforce maximum
     } else {
         DEFAULT_LIMIT
     };
 
-    if offset < 0 || limit <= 0 {
-        return Err(Error::InvalidArguments("offset must be >= 0 and limit must be > 0".to_string()));
-    }
-
     // NOTE: AGQ currently doesn't maintain a global jobs:all index
     // Jobs are only indexed by action (action:{action_id}:jobs)
     // This is a placeholder implementation that returns empty array
-    // TODO: When jobs:all sorted set is added, implement proper listing
+    // TODO(#43): When jobs:all sorted set is added, implement proper listing
+    // See: https://github.com/agenix-sh/agq/issues/43#future-work
 
     let jobs: Vec<RespValue> = Vec::new();
 
@@ -2251,7 +2252,8 @@ fn handle_workers_list(_args: &[RespValue], _db: &Database) -> Result<RespValue>
     // NOTE: AGQ currently doesn't track workers
     // Workers connect via BRPOP and don't register themselves
     // This is a placeholder implementation that returns empty array
-    // TODO: When worker registration is added, implement proper listing
+    // TODO(#43): When worker registration is added, implement proper listing
+    // See: https://github.com/agenix-sh/agq/issues/43#future-work
 
     let workers: Vec<RespValue> = Vec::new();
 
@@ -2278,12 +2280,16 @@ fn handle_queue_stats(_args: &[RespValue], db: &Database) -> Result<RespValue> {
     // Get pending jobs count from queue:ready
     let pending_jobs = db.llen("queue:ready")?;
 
-    // Get scheduled jobs count from queue:scheduled (if it exists)
+    // Get scheduled jobs count from queue:scheduled
     // Note: AGQ doesn't currently use queue:scheduled, but we check for future compatibility
-    let scheduled_jobs = db.llen("queue:scheduled").unwrap_or(0);
+    // If the list doesn't exist, llen returns 0 (not an error), but we handle actual errors
+    let scheduled_jobs = db.llen("queue:scheduled")?;
 
     // Return as flat array: [field1, value1, field2, value2, ...]
     // This matches Redis HGETALL format
+    //
+    // Resource bounds: Currently returns 2 fields (4 array elements).
+    // If additional stats are added in future, consider pagination or limits.
     let stats = vec![
         RespValue::BulkString(b"pending_jobs".to_vec()),
         RespValue::BulkString(pending_jobs.to_string().into_bytes()),
