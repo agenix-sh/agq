@@ -1245,9 +1245,9 @@ fn handle_hincrby(args: &[RespValue], db: &Database) -> Result<RespValue> {
         ));
     }
 
-    let increment: i64 = increment_str.parse().map_err(|_| {
-        Error::InvalidArguments("HINCRBY increment must be an integer".to_string())
-    })?;
+    let increment: i64 = increment_str
+        .parse()
+        .map_err(|_| Error::InvalidArguments("HINCRBY increment must be an integer".to_string()))?;
 
     let new_value = db.hincrby(&key, &field, increment)?;
     Ok(RespValue::Integer(new_value))
@@ -1729,7 +1729,11 @@ fn handle_action_submit(args: &[RespValue], db: &Database) -> Result<RespValue> 
     let plan_stats_key = format!("plan:{}:stats", plan_id);
     db.hincrby(&plan_stats_key, "total_actions", 1)?;
     db.hincrby(&plan_stats_key, "total_jobs", job_ids.len() as i64)?;
-    db.hset(&plan_stats_key, "last_used", timestamp.to_string().as_bytes())?;
+    db.hset(
+        &plan_stats_key,
+        "last_used",
+        timestamp.to_string().as_bytes(),
+    )?;
 
     // Index action by plan_id (for querying actions by plan)
     let plan_actions_key = format!("plan:{}:actions", plan_id);
@@ -1771,14 +1775,17 @@ fn handle_plans_list(args: &[RespValue], db: &Database) -> Result<RespValue> {
 
     // Parse optional offset and limit arguments
     let offset = if args.len() > 1 {
-        args[1].as_string()?.parse::<i64>()
-            .map_err(|_| Error::InvalidArguments("offset must be a non-negative integer".to_string()))?
+        args[1].as_string()?.parse::<i64>().map_err(|_| {
+            Error::InvalidArguments("offset must be a non-negative integer".to_string())
+        })?
     } else {
         0
     };
 
     let limit = if args.len() > 2 {
-        let requested = args[2].as_string()?.parse::<i64>()
+        let requested = args[2]
+            .as_string()?
+            .parse::<i64>()
             .map_err(|_| Error::InvalidArguments("limit must be a positive integer".to_string()))?;
         requested.min(MAX_LIMIT) // Enforce maximum
     } else {
@@ -1786,12 +1793,15 @@ fn handle_plans_list(args: &[RespValue], db: &Database) -> Result<RespValue> {
     };
 
     if offset < 0 || limit <= 0 {
-        return Err(Error::InvalidArguments("offset must be >= 0 and limit must be > 0".to_string()));
+        return Err(Error::InvalidArguments(
+            "offset must be >= 0 and limit must be > 0".to_string(),
+        ));
     }
 
     // Get paginated plan IDs from the plans:all sorted set (sorted by creation time)
     // Use checked arithmetic to prevent integer overflow
-    let stop = offset.checked_add(limit)
+    let stop = offset
+        .checked_add(limit)
         .and_then(|sum| sum.checked_sub(1))
         .ok_or_else(|| Error::InvalidArguments("Pagination range overflow".to_string()))?;
     let plan_entries = db.zrange("plans:all", offset, stop)?;
@@ -1810,7 +1820,8 @@ fn handle_plans_list(args: &[RespValue], db: &Database) -> Result<RespValue> {
         }
 
         // Get task_count from stored metadata (no JSON parsing needed)
-        let task_count_bytes = db.hget(&plan_key, "task_count")?
+        let task_count_bytes = db
+            .hget(&plan_key, "task_count")?
             .unwrap_or_else(|| b"0".to_vec());
         let task_count = std::str::from_utf8(&task_count_bytes)
             .ok()
@@ -1818,17 +1829,16 @@ fn handle_plans_list(args: &[RespValue], db: &Database) -> Result<RespValue> {
             .unwrap_or(0);
 
         // Get description from stored metadata
-        let description_bytes = db.hget(&plan_key, "plan_description")?
-            .unwrap_or_default();
-        let description = std::str::from_utf8(&description_bytes)
-            .unwrap_or("");
+        let description_bytes = db.hget(&plan_key, "plan_description")?.unwrap_or_default();
+        let description = std::str::from_utf8(&description_bytes).unwrap_or("");
 
         // Get creation timestamp
         let created_at_bytes = db.hget(&plan_key, "created_at")?;
         let created_at = if let Some(bytes) = created_at_bytes {
             let ts_str = std::str::from_utf8(&bytes)
                 .map_err(|_| Error::Protocol("Invalid timestamp encoding".to_string()))?;
-            ts_str.parse::<u64>()
+            ts_str
+                .parse::<u64>()
                 .map_err(|_| Error::Protocol("Invalid timestamp format".to_string()))?
         } else {
             0
@@ -1838,7 +1848,8 @@ fn handle_plans_list(args: &[RespValue], db: &Database) -> Result<RespValue> {
         let plan_stats_key = format!("plan:{}:stats", plan_id);
 
         let total_actions = if let Some(bytes) = db.hget(&plan_stats_key, "total_actions")? {
-            std::str::from_utf8(&bytes).ok()
+            std::str::from_utf8(&bytes)
+                .ok()
                 .and_then(|s| s.parse::<i64>().ok())
                 .unwrap_or(0)
         } else {
@@ -1846,7 +1857,8 @@ fn handle_plans_list(args: &[RespValue], db: &Database) -> Result<RespValue> {
         };
 
         let total_jobs = if let Some(bytes) = db.hget(&plan_stats_key, "total_jobs")? {
-            std::str::from_utf8(&bytes).ok()
+            std::str::from_utf8(&bytes)
+                .ok()
                 .and_then(|s| s.parse::<i64>().ok())
                 .unwrap_or(0)
         } else {
@@ -1854,7 +1866,8 @@ fn handle_plans_list(args: &[RespValue], db: &Database) -> Result<RespValue> {
         };
 
         let last_used = if let Some(bytes) = db.hget(&plan_stats_key, "last_used")? {
-            std::str::from_utf8(&bytes).ok()
+            std::str::from_utf8(&bytes)
+                .ok()
                 .and_then(|s| s.parse::<u64>().ok())
                 .unwrap_or(0)
         } else {
@@ -1897,7 +1910,8 @@ fn handle_plans_get(args: &[RespValue], db: &Database) -> Result<RespValue> {
     let plan_key = format!("plan:{}", plan_id);
 
     // Get plan JSON
-    let json_bytes = db.hget(&plan_key, "json")?
+    let json_bytes = db
+        .hget(&plan_key, "json")?
         .ok_or_else(|| Error::InvalidArguments(format!("Plan not found: {}", plan_id)))?;
 
     let json_str = std::str::from_utf8(&json_bytes)
@@ -1911,14 +1925,16 @@ fn handle_plans_get(args: &[RespValue], db: &Database) -> Result<RespValue> {
     if let Some(bytes) = created_at_bytes {
         let ts_str = std::str::from_utf8(&bytes)
             .map_err(|_| Error::Protocol("Invalid timestamp encoding".to_string()))?;
-        let created_at = ts_str.parse::<u64>()
+        let created_at = ts_str
+            .parse::<u64>()
             .map_err(|_| Error::Protocol("Invalid timestamp format".to_string()))?;
 
         // Get usage statistics
         let plan_stats_key = format!("plan:{}:stats", plan_id);
 
         let total_actions = if let Some(bytes) = db.hget(&plan_stats_key, "total_actions")? {
-            std::str::from_utf8(&bytes).ok()
+            std::str::from_utf8(&bytes)
+                .ok()
                 .and_then(|s| s.parse::<i64>().ok())
                 .unwrap_or(0)
         } else {
@@ -1926,7 +1942,8 @@ fn handle_plans_get(args: &[RespValue], db: &Database) -> Result<RespValue> {
         };
 
         let total_jobs = if let Some(bytes) = db.hget(&plan_stats_key, "total_jobs")? {
-            std::str::from_utf8(&bytes).ok()
+            std::str::from_utf8(&bytes)
+                .ok()
                 .and_then(|s| s.parse::<i64>().ok())
                 .unwrap_or(0)
         } else {
@@ -1934,7 +1951,8 @@ fn handle_plans_get(args: &[RespValue], db: &Database) -> Result<RespValue> {
         };
 
         let last_used = if let Some(bytes) = db.hget(&plan_stats_key, "last_used")? {
-            std::str::from_utf8(&bytes).ok()
+            std::str::from_utf8(&bytes)
+                .ok()
                 .and_then(|s| s.parse::<u64>().ok())
                 .unwrap_or(0)
         } else {
@@ -1988,14 +2006,17 @@ fn handle_actions_list(args: &[RespValue], db: &Database) -> Result<RespValue> {
 
     // Parse pagination arguments
     let offset = if args.len() > 2 {
-        args[2].as_string()?.parse::<i64>()
-            .map_err(|_| Error::InvalidArguments("offset must be a non-negative integer".to_string()))?
+        args[2].as_string()?.parse::<i64>().map_err(|_| {
+            Error::InvalidArguments("offset must be a non-negative integer".to_string())
+        })?
     } else {
         0
     };
 
     let limit = if args.len() > 3 {
-        let requested = args[3].as_string()?.parse::<i64>()
+        let requested = args[3]
+            .as_string()?
+            .parse::<i64>()
             .map_err(|_| Error::InvalidArguments("limit must be a positive integer".to_string()))?;
         requested.min(MAX_LIMIT)
     } else {
@@ -2003,16 +2024,21 @@ fn handle_actions_list(args: &[RespValue], db: &Database) -> Result<RespValue> {
     };
 
     if offset < 0 {
-        return Err(Error::InvalidArguments("offset must be non-negative".to_string()));
+        return Err(Error::InvalidArguments(
+            "offset must be non-negative".to_string(),
+        ));
     }
 
     if limit <= 0 {
-        return Err(Error::InvalidArguments("limit must be positive".to_string()));
+        return Err(Error::InvalidArguments(
+            "limit must be positive".to_string(),
+        ));
     }
 
     // Get all actions from the sorted set (indexed by timestamp)
     // Use checked arithmetic to prevent overflow
-    let stop = offset.checked_add(limit)
+    let stop = offset
+        .checked_add(limit)
         .and_then(|sum| sum.checked_sub(1))
         .ok_or_else(|| Error::InvalidArguments("Pagination range overflow".to_string()))?;
 
@@ -2027,15 +2053,18 @@ fn handle_actions_list(args: &[RespValue], db: &Database) -> Result<RespValue> {
         let action_key = format!("action:{}", action_id);
 
         // Get action metadata
-        let plan_id = db.hget(&action_key, "plan_id")?
+        let plan_id = db
+            .hget(&action_key, "plan_id")?
             .and_then(|bytes| std::str::from_utf8(&bytes).ok().map(|s| s.to_string()));
 
-        let status = db.hget(&action_key, "status")?
+        let status = db
+            .hget(&action_key, "status")?
             .and_then(|bytes| std::str::from_utf8(&bytes).ok().map(|s| s.to_string()))
             .unwrap_or_else(|| "pending".to_string());
 
         let created_at = if let Some(bytes) = db.hget(&action_key, "created_at")? {
-            std::str::from_utf8(&bytes).ok()
+            std::str::from_utf8(&bytes)
+                .ok()
                 .and_then(|s| s.parse::<u64>().ok())
                 .unwrap_or(0)
         } else {
@@ -2052,7 +2081,8 @@ fn handle_actions_list(args: &[RespValue], db: &Database) -> Result<RespValue> {
         // Read cached job status counters (avoids N+1 query problem)
         // These counters are maintained by ACTION.SUBMIT and updated by workers
         let jobs_completed = if let Some(bytes) = db.hget(&action_key, "jobs_completed")? {
-            std::str::from_utf8(&bytes).ok()
+            std::str::from_utf8(&bytes)
+                .ok()
                 .and_then(|s| s.parse::<i64>().ok())
                 .unwrap_or(0)
         } else {
@@ -2060,7 +2090,8 @@ fn handle_actions_list(args: &[RespValue], db: &Database) -> Result<RespValue> {
         };
 
         let jobs_failed = if let Some(bytes) = db.hget(&action_key, "jobs_failed")? {
-            std::str::from_utf8(&bytes).ok()
+            std::str::from_utf8(&bytes)
+                .ok()
                 .and_then(|s| s.parse::<i64>().ok())
                 .unwrap_or(0)
         } else {
@@ -2068,7 +2099,8 @@ fn handle_actions_list(args: &[RespValue], db: &Database) -> Result<RespValue> {
         };
 
         let jobs_pending = if let Some(bytes) = db.hget(&action_key, "jobs_pending")? {
-            std::str::from_utf8(&bytes).ok()
+            std::str::from_utf8(&bytes)
+                .ok()
                 .and_then(|s| s.parse::<i64>().ok())
                 .unwrap_or(0)
         } else {
@@ -2123,34 +2155,40 @@ fn handle_actions_get(args: &[RespValue], db: &Database) -> Result<RespValue> {
 
     // Parse optional job pagination arguments
     let job_offset = if args.len() > 2 {
-        args[2].as_string()?.parse::<i64>()
-            .map_err(|_| Error::InvalidArguments("job_offset must be a non-negative integer".to_string()))?
+        args[2].as_string()?.parse::<i64>().map_err(|_| {
+            Error::InvalidArguments("job_offset must be a non-negative integer".to_string())
+        })?
     } else {
         0
     };
 
     let job_limit = if args.len() > 3 {
-        let requested = args[3].as_string()?.parse::<i64>()
-            .map_err(|_| Error::InvalidArguments("job_limit must be a positive integer".to_string()))?;
+        let requested = args[3].as_string()?.parse::<i64>().map_err(|_| {
+            Error::InvalidArguments("job_limit must be a positive integer".to_string())
+        })?;
         requested.min(MAX_JOB_LIMIT) // Enforce maximum
     } else {
         DEFAULT_JOB_LIMIT
     };
 
     if job_offset < 0 || job_limit <= 0 {
-        return Err(Error::InvalidArguments("job_offset must be >= 0 and job_limit must be > 0".to_string()));
+        return Err(Error::InvalidArguments(
+            "job_offset must be >= 0 and job_limit must be > 0".to_string(),
+        ));
     }
 
     let action_key = format!("action:{}", action_id);
 
     // Get action metadata
-    let plan_id_bytes = db.hget(&action_key, "plan_id")?
+    let plan_id_bytes = db
+        .hget(&action_key, "plan_id")?
         .ok_or_else(|| Error::InvalidArguments(format!("Action not found: {}", action_id)))?;
 
     let plan_id = String::from_utf8(plan_id_bytes)
         .map_err(|_| Error::Protocol("Invalid plan_id encoding".to_string()))?;
 
-    let status_bytes = db.hget(&action_key, "status")?
+    let status_bytes = db
+        .hget(&action_key, "status")?
         .unwrap_or_else(|| b"unknown".to_vec());
     let status = String::from_utf8(status_bytes)
         .map_err(|_| Error::Protocol("Invalid status encoding".to_string()))?;
@@ -2161,7 +2199,8 @@ fn handle_actions_get(args: &[RespValue], db: &Database) -> Result<RespValue> {
     let created_at = if let Some(bytes) = created_at_bytes {
         let ts_str = std::str::from_utf8(&bytes)
             .map_err(|_| Error::Protocol("Invalid timestamp encoding".to_string()))?;
-        ts_str.parse::<u64>()
+        ts_str
+            .parse::<u64>()
             .map_err(|_| Error::Protocol("Invalid timestamp format".to_string()))?
     } else {
         0
@@ -2170,7 +2209,8 @@ fn handle_actions_get(args: &[RespValue], db: &Database) -> Result<RespValue> {
     // Read cached job status counters (avoids N+1 query problem)
     // These counters are maintained by ACTION.SUBMIT and updated by workers
     let jobs_completed = if let Some(bytes) = db.hget(&action_key, "jobs_completed")? {
-        std::str::from_utf8(&bytes).ok()
+        std::str::from_utf8(&bytes)
+            .ok()
             .and_then(|s| s.parse::<u64>().ok())
             .unwrap_or(0)
     } else {
@@ -2178,7 +2218,8 @@ fn handle_actions_get(args: &[RespValue], db: &Database) -> Result<RespValue> {
     };
 
     let jobs_failed = if let Some(bytes) = db.hget(&action_key, "jobs_failed")? {
-        std::str::from_utf8(&bytes).ok()
+        std::str::from_utf8(&bytes)
+            .ok()
             .and_then(|s| s.parse::<u64>().ok())
             .unwrap_or(0)
     } else {
@@ -2186,7 +2227,8 @@ fn handle_actions_get(args: &[RespValue], db: &Database) -> Result<RespValue> {
     };
 
     let jobs_pending = if let Some(bytes) = db.hget(&action_key, "jobs_pending")? {
-        std::str::from_utf8(&bytes).ok()
+        std::str::from_utf8(&bytes)
+            .ok()
             .and_then(|s| s.parse::<u64>().ok())
             .unwrap_or(0)
     } else {
@@ -2199,7 +2241,8 @@ fn handle_actions_get(args: &[RespValue], db: &Database) -> Result<RespValue> {
 
     // Get paginated job list for job_ids array
     // Use checked arithmetic to prevent integer overflow
-    let job_stop = job_offset.checked_add(job_limit)
+    let job_stop = job_offset
+        .checked_add(job_limit)
         .and_then(|sum| sum.checked_sub(1))
         .ok_or_else(|| Error::InvalidArguments("Job pagination range overflow".to_string()))?;
     let job_ids_bytes = db.lrange(&action_jobs_key, job_offset, job_stop)?;
@@ -2232,8 +2275,15 @@ fn handle_actions_get(args: &[RespValue], db: &Database) -> Result<RespValue> {
     let response_json = serde_json::to_string(&response)
         .map_err(|_| Error::Protocol("Failed to serialize response".to_string()))?;
 
-    debug!("ACTION.GET {} -> {}/{} jobs (completed: {}, failed: {}, pending: {})",
-           action_id, job_ids.len(), jobs_total, jobs_completed, jobs_failed, jobs_pending);
+    debug!(
+        "ACTION.GET {} -> {}/{} jobs (completed: {}, failed: {}, pending: {})",
+        action_id,
+        job_ids.len(),
+        jobs_total,
+        jobs_completed,
+        jobs_failed,
+        jobs_pending
+    );
     Ok(RespValue::BulkString(response_json.into_bytes()))
 }
 
@@ -2261,14 +2311,17 @@ fn handle_jobs_list(args: &[RespValue], _db: &Database) -> Result<RespValue> {
     // Parse optional offset and limit arguments
     // Using u64 enforces non-negativity at type level
     let offset = if args.len() > 1 {
-        args[1].as_string()?.parse::<u64>()
-            .map_err(|_| Error::InvalidArguments("offset must be a non-negative integer".to_string()))?
+        args[1].as_string()?.parse::<u64>().map_err(|_| {
+            Error::InvalidArguments("offset must be a non-negative integer".to_string())
+        })?
     } else {
         0
     };
 
     let limit = if args.len() > 2 {
-        let requested = args[2].as_string()?.parse::<u64>()
+        let requested = args[2]
+            .as_string()?
+            .parse::<u64>()
             .map_err(|_| Error::InvalidArguments("limit must be a positive integer".to_string()))?;
         if requested == 0 {
             return Err(Error::InvalidArguments("limit must be > 0".to_string()));
@@ -2286,7 +2339,12 @@ fn handle_jobs_list(args: &[RespValue], _db: &Database) -> Result<RespValue> {
 
     let jobs: Vec<RespValue> = Vec::new();
 
-    debug!("JOBS.LIST -> {} jobs (offset: {}, limit: {})", jobs.len(), offset, limit);
+    debug!(
+        "JOBS.LIST -> {} jobs (offset: {}, limit: {})",
+        jobs.len(),
+        offset,
+        limit
+    );
     Ok(RespValue::Array(jobs))
 }
 
@@ -2336,14 +2394,16 @@ fn handle_job_get(args: &[RespValue], db: &Database) -> Result<RespValue> {
     let job_key = format!("job:{}", job_id);
 
     // Check if job exists
-    let plan_id_bytes = db.hget(&job_key, "plan_id")?
+    let plan_id_bytes = db
+        .hget(&job_key, "plan_id")?
         .ok_or_else(|| Error::InvalidArguments(format!("Job not found: {}", job_id)))?;
 
     let plan_id = String::from_utf8(plan_id_bytes)
         .map_err(|_| Error::Protocol("Invalid plan_id encoding".to_string()))?;
 
     // Get job metadata
-    let status_bytes = db.hget(&job_key, "status")?
+    let status_bytes = db
+        .hget(&job_key, "status")?
         .unwrap_or_else(|| b"unknown".to_vec());
     let status = String::from_utf8(status_bytes)
         .map_err(|_| Error::Protocol("Invalid status encoding".to_string()))?;
@@ -2352,14 +2412,16 @@ fn handle_job_get(args: &[RespValue], db: &Database) -> Result<RespValue> {
     let created_at = if let Some(bytes) = created_at_bytes {
         let ts_str = std::str::from_utf8(&bytes)
             .map_err(|_| Error::Protocol("Invalid timestamp encoding".to_string()))?;
-        ts_str.parse::<u64>()
+        ts_str
+            .parse::<u64>()
             .map_err(|_| Error::Protocol("Invalid timestamp format".to_string()))?
     } else {
         0
     };
 
     // Get input data (stored as JSON)
-    let input_bytes = db.hget(&job_key, "input")?
+    let input_bytes = db
+        .hget(&job_key, "input")?
         .unwrap_or_else(|| b"{}".to_vec());
     let input_str = std::str::from_utf8(&input_bytes)
         .map_err(|_| Error::Protocol("Invalid input encoding".to_string()))?;
@@ -2368,7 +2430,8 @@ fn handle_job_get(args: &[RespValue], db: &Database) -> Result<RespValue> {
 
     // Get input_index if it exists
     let input_index = if let Some(bytes) = db.hget(&job_key, "input_index")? {
-        std::str::from_utf8(&bytes).ok()
+        std::str::from_utf8(&bytes)
+            .ok()
             .and_then(|s| s.parse::<u64>().ok())
     } else {
         None
@@ -2390,7 +2453,10 @@ fn handle_job_get(args: &[RespValue], db: &Database) -> Result<RespValue> {
     let response_json = serde_json::to_string(&response)
         .map_err(|_| Error::Protocol("Failed to serialize response".to_string()))?;
 
-    debug!("JOB.GET {} -> plan_id: {}, status: {}", job_id, plan_id, status);
+    debug!(
+        "JOB.GET {} -> plan_id: {}, status: {}",
+        job_id, plan_id, status
+    );
     Ok(RespValue::BulkString(response_json.into_bytes()))
 }
 
@@ -2592,7 +2658,10 @@ fn handle_queue_stats(_args: &[RespValue], db: &Database) -> Result<RespValue> {
         RespValue::BulkString(scheduled_jobs.to_string().into_bytes()),
     ];
 
-    debug!("QUEUE.STATS -> pending: {}, scheduled: {}", pending_jobs, scheduled_jobs);
+    debug!(
+        "QUEUE.STATS -> pending: {}, scheduled: {}",
+        pending_jobs, scheduled_jobs
+    );
     Ok(RespValue::Array(stats))
 }
 

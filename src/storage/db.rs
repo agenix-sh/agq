@@ -1052,9 +1052,7 @@ impl ListOps for Database {
 
         // Security: Handle i64::MIN edge case for count
         if count == i64::MIN {
-            return Err(Error::InvalidArguments(
-                "Invalid count value".to_string(),
-            ));
+            return Err(Error::InvalidArguments("Invalid count value".to_string()));
         }
 
         // Begin write transaction
@@ -1078,9 +1076,7 @@ impl ListOps for Database {
                     // List doesn't exist - return 0 removed count
                     (0, -1) // Empty list markers (head > tail)
                 }
-                Err(e) => {
-                    return Err(Error::Protocol(format!("Failed to get list metadata: {e}")))
-                }
+                Err(e) => return Err(Error::Protocol(format!("Failed to get list metadata: {e}"))),
             };
 
             // If list is empty, return 0
@@ -1163,9 +1159,9 @@ impl ListOps for Database {
 
                     if remaining_elements.is_empty() {
                         // List is now empty, remove metadata
-                        meta_table
-                            .remove(key)
-                            .map_err(|e| Error::Protocol(format!("Failed to remove metadata: {e}")))?;
+                        meta_table.remove(key).map_err(|e| {
+                            Error::Protocol(format!("Failed to remove metadata: {e}"))
+                        })?;
                     } else {
                         // Re-write the list with new indices starting from head
                         let new_tail = head
@@ -1749,9 +1745,7 @@ impl HashOps for Database {
                     std::str::from_utf8(bytes)
                         .map_err(|e| Error::Protocol(format!("Invalid UTF-8 in hash field: {e}")))?
                         .parse::<i64>()
-                        .map_err(|e| {
-                            Error::Protocol(format!("Hash field is not an integer: {e}"))
-                        })
+                        .map_err(|e| Error::Protocol(format!("Hash field is not an integer: {e}")))
                 })
                 .transpose()?
                 .unwrap_or(0);
@@ -1768,7 +1762,8 @@ impl HashOps for Database {
                     .range(prefix.as_str()..)
                     .map_err(|e| Error::Protocol(format!("Failed to count fields: {e}")))?
                 {
-                    let (k, _) = item.map_err(|e| Error::Protocol(format!("Failed to read field: {e}")))?;
+                    let (k, _) =
+                        item.map_err(|e| Error::Protocol(format!("Failed to read field: {e}")))?;
                     let key_str = k.value();
 
                     // Stop counting if we've moved past this hash's fields
@@ -2575,10 +2570,7 @@ mod tests {
 
         let result = db.lrem(&oversized_key, 1, b"value");
         assert!(result.is_err());
-        assert!(result
-            .unwrap_err()
-            .to_string()
-            .contains("exceeds maximum"));
+        assert!(result.unwrap_err().to_string().contains("exceeds maximum"));
     }
 
     #[test]
@@ -2590,10 +2582,7 @@ mod tests {
 
         let result = db.lrem("list", 1, &oversized_element);
         assert!(result.is_err());
-        assert!(result
-            .unwrap_err()
-            .to_string()
-            .contains("exceeds maximum"));
+        assert!(result.unwrap_err().to_string().contains("exceeds maximum"));
     }
 
     // Sorted Set Tests
@@ -3089,7 +3078,8 @@ mod tests {
         let (db, _temp) = test_db();
 
         // Set a non-integer value
-        db.hset("stats:plan_abc", "description", b"not a number").unwrap();
+        db.hset("stats:plan_abc", "description", b"not a number")
+            .unwrap();
 
         // Try to increment it - should fail
         let result = db.hincrby("stats:plan_abc", "description", 1);

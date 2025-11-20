@@ -156,9 +156,7 @@ async fn store_plan(job: &InternalJob, db: &Database) -> Result<()> {
         .map(|tasks| tasks.len())
         .unwrap_or(0);
 
-    let plan_description = plan_value["plan_description"]
-        .as_str()
-        .unwrap_or("");
+    let plan_description = plan_value["plan_description"].as_str().unwrap_or("");
 
     // Store plan hash with metadata
     db.hset(&plan_key, "json", job.payload.as_bytes())?;
@@ -168,11 +166,7 @@ async fn store_plan(job: &InternalJob, db: &Database) -> Result<()> {
         "created_at",
         job.timestamp.to_string().as_bytes(),
     )?;
-    db.hset(
-        &plan_key,
-        "task_count",
-        task_count.to_string().as_bytes(),
-    )?;
+    db.hset(&plan_key, "task_count", task_count.to_string().as_bytes())?;
     db.hset(&plan_key, "plan_description", plan_description.as_bytes())?;
 
     // Index plan in sorted set (for listing/discovery)

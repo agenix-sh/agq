@@ -3311,13 +3311,28 @@ async fn test_workers_list_includes_metadata() {
     let response_str = std::str::from_utf8(&response).unwrap();
 
     // Should include worker metadata
-    assert!(response_str.contains("worker_metadata"), "Response should contain worker_metadata");
-    assert!(response_str.contains("last_seen"), "Response should contain last_seen");
-    assert!(response_str.contains("status"), "Response should contain status");
-    assert!(response_str.contains("active"), "Response should contain active status");
+    assert!(
+        response_str.contains("worker_metadata"),
+        "Response should contain worker_metadata"
+    );
+    assert!(
+        response_str.contains("last_seen"),
+        "Response should contain last_seen"
+    );
+    assert!(
+        response_str.contains("status"),
+        "Response should contain status"
+    );
+    assert!(
+        response_str.contains("active"),
+        "Response should contain active status"
+    );
 
     // Tools field will be empty since we didn't register any
-    assert!(response_str.contains("tools"), "Response should contain tools field");
+    assert!(
+        response_str.contains("tools"),
+        "Response should contain tools field"
+    );
 }
 
 #[tokio::test]
@@ -3404,5 +3419,8 @@ async fn test_workers_list_sorted_by_last_seen() {
     // worker_2 should appear before worker_1 (most recent first)
     let worker2_pos = response_str.find("worker_2").unwrap();
     let worker1_pos = response_str.find("worker_1").unwrap();
-    assert!(worker2_pos < worker1_pos, "Workers should be sorted by last_seen (most recent first)");
+    assert!(
+        worker2_pos < worker1_pos,
+        "Workers should be sorted by last_seen (most recent first)"
+    );
 }
