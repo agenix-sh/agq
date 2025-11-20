@@ -181,7 +181,7 @@ async fn handle_command(
             if !*authenticated {
                 return Err(Error::NoAuth);
             }
-            handle_ping(&args)
+            handle_ping(&args, db)
         }
         "GET" => {
             if !*authenticated {
@@ -466,20 +466,61 @@ fn handle_auth(
 /// Supports both:
 /// - PING -> +PONG
 /// - PING message -> $7\r\nmessage\r\n (echo)
-fn handle_ping(args: &[RespValue]) -> Result<RespValue> {
+/// Worker heartbeat TTL (5 minutes)
+///
+/// Workers are expected to send heartbeats every 60 seconds.
+/// This 5-minute TTL allows for network issues and temporary disruptions
+/// without immediately marking workers as stale.
+const WORKER_HEARTBEAT_TTL_SECS: u64 = 300;
+
+/// Maximum number of workers allowed
+///
+/// Prevents resource exhaustion attacks where an attacker creates unlimited workers.
+/// Even with TTL, an attacker could maintain 10,000+ active workers by sending
+/// heartbeats every 60 seconds. This limit caps the total number of registered workers.
+const MAX_WORKERS: usize = 1000;
+
+/// Rate limiter for worker heartbeat registration (PING with worker_id)
+///
+/// Prevents DoS attacks via rapid worker creation.
+/// Limit: 1000 heartbeats per minute (reasonable for legitimate usage)
+///
+/// Legitimate scenario: 100 workers × 1 heartbeat/minute = 100 req/min
+/// This limit provides 10x headroom for burst traffic and misconfiguration.
+static WORKER_HEARTBEAT_LIMITER: Lazy<
+    governor::RateLimiter<
+        governor::state::direct::NotKeyed,
+        governor::state::InMemoryState,
+        governor::clock::DefaultClock,
+    >,
+> = Lazy::new(|| governor::RateLimiter::direct(Quota::per_minute(NonZeroU32::new(1000).unwrap())));
+
+fn handle_ping(args: &[RespValue], db: &Database) -> Result<RespValue> {
     match args.len() {
         1 => {
             // Simple PING
             Ok(RespValue::SimpleString("PONG".to_string()))
         }
         2 => {
-            // PING with message - echo it back
-            match &args[1] {
-                RespValue::BulkString(msg) => Ok(RespValue::BulkString(msg.clone())),
-                _ => Err(Error::InvalidArguments(
-                    "PING message must be a bulk string".to_string(),
-                )),
+            // PING with worker_id - treat as heartbeat
+            // Security: Check rate limit to prevent DoS via rapid worker creation
+            if WORKER_HEARTBEAT_LIMITER.check().is_err() {
+                warn!("Worker heartbeat rate limit exceeded");
+                return Err(Error::Protocol(
+                    "Rate limit exceeded for worker heartbeats (max 1000/minute)".to_string(),
+                ));
             }
+
+            let worker_id = args[1].as_string()?;
+
+            // Validate worker_id
+            validate_identifier(&worker_id, "worker_id")?;
+
+            // Update worker heartbeat
+            register_worker_heartbeat(db, &worker_id)?;
+
+            // Echo back worker_id (standard PING behavior)
+            Ok(RespValue::BulkString(worker_id.as_bytes().to_vec()))
         }
         _ => Err(Error::InvalidArguments(
             "PING accepts 0 or 1 arguments".to_string(),
@@ -1234,9 +1275,9 @@ fn handle_hincrby(args: &[RespValue], db: &Database) -> Result<RespValue> {
         ));
     }
 
-    let increment: i64 = increment_str.parse().map_err(|_| {
-        Error::InvalidArguments("HINCRBY increment must be an integer".to_string())
-    })?;
+    let increment: i64 = increment_str
+        .parse()
+        .map_err(|_| Error::InvalidArguments("HINCRBY increment must be an integer".to_string()))?;
 
     let new_value = db.hincrby(&key, &field, increment)?;
     Ok(RespValue::Integer(new_value))
@@ -1718,7 +1759,11 @@ fn handle_action_submit(args: &[RespValue], db: &Database) -> Result<RespValue> 
     let plan_stats_key = format!("plan:{}:stats", plan_id);
     db.hincrby(&plan_stats_key, "total_actions", 1)?;
     db.hincrby(&plan_stats_key, "total_jobs", job_ids.len() as i64)?;
-    db.hset(&plan_stats_key, "last_used", timestamp.to_string().as_bytes())?;
+    db.hset(
+        &plan_stats_key,
+        "last_used",
+        timestamp.to_string().as_bytes(),
+    )?;
 
     // Index action by plan_id (for querying actions by plan)
     let plan_actions_key = format!("plan:{}:actions", plan_id);
@@ -1760,14 +1805,17 @@ fn handle_plans_list(args: &[RespValue], db: &Database) -> Result<RespValue> {
 
     // Parse optional offset and limit arguments
     let offset = if args.len() > 1 {
-        args[1].as_string()?.parse::<i64>()
-            .map_err(|_| Error::InvalidArguments("offset must be a non-negative integer".to_string()))?
+        args[1].as_string()?.parse::<i64>().map_err(|_| {
+            Error::InvalidArguments("offset must be a non-negative integer".to_string())
+        })?
     } else {
         0
     };
 
     let limit = if args.len() > 2 {
-        let requested = args[2].as_string()?.parse::<i64>()
+        let requested = args[2]
+            .as_string()?
+            .parse::<i64>()
             .map_err(|_| Error::InvalidArguments("limit must be a positive integer".to_string()))?;
         requested.min(MAX_LIMIT) // Enforce maximum
     } else {
@@ -1775,12 +1823,15 @@ fn handle_plans_list(args: &[RespValue], db: &Database) -> Result<RespValue> {
     };
 
     if offset < 0 || limit <= 0 {
-        return Err(Error::InvalidArguments("offset must be >= 0 and limit must be > 0".to_string()));
+        return Err(Error::InvalidArguments(
+            "offset must be >= 0 and limit must be > 0".to_string(),
+        ));
     }
 
     // Get paginated plan IDs from the plans:all sorted set (sorted by creation time)
     // Use checked arithmetic to prevent integer overflow
-    let stop = offset.checked_add(limit)
+    let stop = offset
+        .checked_add(limit)
         .and_then(|sum| sum.checked_sub(1))
         .ok_or_else(|| Error::InvalidArguments("Pagination range overflow".to_string()))?;
     let plan_entries = db.zrange("plans:all", offset, stop)?;
@@ -1799,7 +1850,8 @@ fn handle_plans_list(args: &[RespValue], db: &Database) -> Result<RespValue> {
         }
 
         // Get task_count from stored metadata (no JSON parsing needed)
-        let task_count_bytes = db.hget(&plan_key, "task_count")?
+        let task_count_bytes = db
+            .hget(&plan_key, "task_count")?
             .unwrap_or_else(|| b"0".to_vec());
         let task_count = std::str::from_utf8(&task_count_bytes)
             .ok()
@@ -1807,17 +1859,16 @@ fn handle_plans_list(args: &[RespValue], db: &Database) -> Result<RespValue> {
             .unwrap_or(0);
 
         // Get description from stored metadata
-        let description_bytes = db.hget(&plan_key, "plan_description")?
-            .unwrap_or_default();
-        let description = std::str::from_utf8(&description_bytes)
-            .unwrap_or("");
+        let description_bytes = db.hget(&plan_key, "plan_description")?.unwrap_or_default();
+        let description = std::str::from_utf8(&description_bytes).unwrap_or("");
 
         // Get creation timestamp
         let created_at_bytes = db.hget(&plan_key, "created_at")?;
         let created_at = if let Some(bytes) = created_at_bytes {
             let ts_str = std::str::from_utf8(&bytes)
                 .map_err(|_| Error::Protocol("Invalid timestamp encoding".to_string()))?;
-            ts_str.parse::<u64>()
+            ts_str
+                .parse::<u64>()
                 .map_err(|_| Error::Protocol("Invalid timestamp format".to_string()))?
         } else {
             0
@@ -1827,7 +1878,8 @@ fn handle_plans_list(args: &[RespValue], db: &Database) -> Result<RespValue> {
         let plan_stats_key = format!("plan:{}:stats", plan_id);
 
         let total_actions = if let Some(bytes) = db.hget(&plan_stats_key, "total_actions")? {
-            std::str::from_utf8(&bytes).ok()
+            std::str::from_utf8(&bytes)
+                .ok()
                 .and_then(|s| s.parse::<i64>().ok())
                 .unwrap_or(0)
         } else {
@@ -1835,7 +1887,8 @@ fn handle_plans_list(args: &[RespValue], db: &Database) -> Result<RespValue> {
         };
 
         let total_jobs = if let Some(bytes) = db.hget(&plan_stats_key, "total_jobs")? {
-            std::str::from_utf8(&bytes).ok()
+            std::str::from_utf8(&bytes)
+                .ok()
                 .and_then(|s| s.parse::<i64>().ok())
                 .unwrap_or(0)
         } else {
@@ -1843,7 +1896,8 @@ fn handle_plans_list(args: &[RespValue], db: &Database) -> Result<RespValue> {
         };
 
         let last_used = if let Some(bytes) = db.hget(&plan_stats_key, "last_used")? {
-            std::str::from_utf8(&bytes).ok()
+            std::str::from_utf8(&bytes)
+                .ok()
                 .and_then(|s| s.parse::<u64>().ok())
                 .unwrap_or(0)
         } else {
@@ -1886,7 +1940,8 @@ fn handle_plans_get(args: &[RespValue], db: &Database) -> Result<RespValue> {
     let plan_key = format!("plan:{}", plan_id);
 
     // Get plan JSON
-    let json_bytes = db.hget(&plan_key, "json")?
+    let json_bytes = db
+        .hget(&plan_key, "json")?
         .ok_or_else(|| Error::InvalidArguments(format!("Plan not found: {}", plan_id)))?;
 
     let json_str = std::str::from_utf8(&json_bytes)
@@ -1900,14 +1955,16 @@ fn handle_plans_get(args: &[RespValue], db: &Database) -> Result<RespValue> {
     if let Some(bytes) = created_at_bytes {
         let ts_str = std::str::from_utf8(&bytes)
             .map_err(|_| Error::Protocol("Invalid timestamp encoding".to_string()))?;
-        let created_at = ts_str.parse::<u64>()
+        let created_at = ts_str
+            .parse::<u64>()
             .map_err(|_| Error::Protocol("Invalid timestamp format".to_string()))?;
 
         // Get usage statistics
         let plan_stats_key = format!("plan:{}:stats", plan_id);
 
         let total_actions = if let Some(bytes) = db.hget(&plan_stats_key, "total_actions")? {
-            std::str::from_utf8(&bytes).ok()
+            std::str::from_utf8(&bytes)
+                .ok()
                 .and_then(|s| s.parse::<i64>().ok())
                 .unwrap_or(0)
         } else {
@@ -1915,7 +1972,8 @@ fn handle_plans_get(args: &[RespValue], db: &Database) -> Result<RespValue> {
         };
 
         let total_jobs = if let Some(bytes) = db.hget(&plan_stats_key, "total_jobs")? {
-            std::str::from_utf8(&bytes).ok()
+            std::str::from_utf8(&bytes)
+                .ok()
                 .and_then(|s| s.parse::<i64>().ok())
                 .unwrap_or(0)
         } else {
@@ -1923,7 +1981,8 @@ fn handle_plans_get(args: &[RespValue], db: &Database) -> Result<RespValue> {
         };
 
         let last_used = if let Some(bytes) = db.hget(&plan_stats_key, "last_used")? {
-            std::str::from_utf8(&bytes).ok()
+            std::str::from_utf8(&bytes)
+                .ok()
                 .and_then(|s| s.parse::<u64>().ok())
                 .unwrap_or(0)
         } else {
@@ -1977,14 +2036,17 @@ fn handle_actions_list(args: &[RespValue], db: &Database) -> Result<RespValue> {
 
     // Parse pagination arguments
     let offset = if args.len() > 2 {
-        args[2].as_string()?.parse::<i64>()
-            .map_err(|_| Error::InvalidArguments("offset must be a non-negative integer".to_string()))?
+        args[2].as_string()?.parse::<i64>().map_err(|_| {
+            Error::InvalidArguments("offset must be a non-negative integer".to_string())
+        })?
     } else {
         0
     };
 
     let limit = if args.len() > 3 {
-        let requested = args[3].as_string()?.parse::<i64>()
+        let requested = args[3]
+            .as_string()?
+            .parse::<i64>()
             .map_err(|_| Error::InvalidArguments("limit must be a positive integer".to_string()))?;
         requested.min(MAX_LIMIT)
     } else {
@@ -1992,16 +2054,21 @@ fn handle_actions_list(args: &[RespValue], db: &Database) -> Result<RespValue> {
     };
 
     if offset < 0 {
-        return Err(Error::InvalidArguments("offset must be non-negative".to_string()));
+        return Err(Error::InvalidArguments(
+            "offset must be non-negative".to_string(),
+        ));
     }
 
     if limit <= 0 {
-        return Err(Error::InvalidArguments("limit must be positive".to_string()));
+        return Err(Error::InvalidArguments(
+            "limit must be positive".to_string(),
+        ));
     }
 
     // Get all actions from the sorted set (indexed by timestamp)
     // Use checked arithmetic to prevent overflow
-    let stop = offset.checked_add(limit)
+    let stop = offset
+        .checked_add(limit)
         .and_then(|sum| sum.checked_sub(1))
         .ok_or_else(|| Error::InvalidArguments("Pagination range overflow".to_string()))?;
 
@@ -2016,15 +2083,18 @@ fn handle_actions_list(args: &[RespValue], db: &Database) -> Result<RespValue> {
         let action_key = format!("action:{}", action_id);
 
         // Get action metadata
-        let plan_id = db.hget(&action_key, "plan_id")?
+        let plan_id = db
+            .hget(&action_key, "plan_id")?
             .and_then(|bytes| std::str::from_utf8(&bytes).ok().map(|s| s.to_string()));
 
-        let status = db.hget(&action_key, "status")?
+        let status = db
+            .hget(&action_key, "status")?
             .and_then(|bytes| std::str::from_utf8(&bytes).ok().map(|s| s.to_string()))
             .unwrap_or_else(|| "pending".to_string());
 
         let created_at = if let Some(bytes) = db.hget(&action_key, "created_at")? {
-            std::str::from_utf8(&bytes).ok()
+            std::str::from_utf8(&bytes)
+                .ok()
                 .and_then(|s| s.parse::<u64>().ok())
                 .unwrap_or(0)
         } else {
@@ -2041,7 +2111,8 @@ fn handle_actions_list(args: &[RespValue], db: &Database) -> Result<RespValue> {
         // Read cached job status counters (avoids N+1 query problem)
         // These counters are maintained by ACTION.SUBMIT and updated by workers
         let jobs_completed = if let Some(bytes) = db.hget(&action_key, "jobs_completed")? {
-            std::str::from_utf8(&bytes).ok()
+            std::str::from_utf8(&bytes)
+                .ok()
                 .and_then(|s| s.parse::<i64>().ok())
                 .unwrap_or(0)
         } else {
@@ -2049,7 +2120,8 @@ fn handle_actions_list(args: &[RespValue], db: &Database) -> Result<RespValue> {
         };
 
         let jobs_failed = if let Some(bytes) = db.hget(&action_key, "jobs_failed")? {
-            std::str::from_utf8(&bytes).ok()
+            std::str::from_utf8(&bytes)
+                .ok()
                 .and_then(|s| s.parse::<i64>().ok())
                 .unwrap_or(0)
         } else {
@@ -2057,7 +2129,8 @@ fn handle_actions_list(args: &[RespValue], db: &Database) -> Result<RespValue> {
         };
 
         let jobs_pending = if let Some(bytes) = db.hget(&action_key, "jobs_pending")? {
-            std::str::from_utf8(&bytes).ok()
+            std::str::from_utf8(&bytes)
+                .ok()
                 .and_then(|s| s.parse::<i64>().ok())
                 .unwrap_or(0)
         } else {
@@ -2112,34 +2185,40 @@ fn handle_actions_get(args: &[RespValue], db: &Database) -> Result<RespValue> {
 
     // Parse optional job pagination arguments
     let job_offset = if args.len() > 2 {
-        args[2].as_string()?.parse::<i64>()
-            .map_err(|_| Error::InvalidArguments("job_offset must be a non-negative integer".to_string()))?
+        args[2].as_string()?.parse::<i64>().map_err(|_| {
+            Error::InvalidArguments("job_offset must be a non-negative integer".to_string())
+        })?
     } else {
         0
     };
 
     let job_limit = if args.len() > 3 {
-        let requested = args[3].as_string()?.parse::<i64>()
-            .map_err(|_| Error::InvalidArguments("job_limit must be a positive integer".to_string()))?;
+        let requested = args[3].as_string()?.parse::<i64>().map_err(|_| {
+            Error::InvalidArguments("job_limit must be a positive integer".to_string())
+        })?;
         requested.min(MAX_JOB_LIMIT) // Enforce maximum
     } else {
         DEFAULT_JOB_LIMIT
     };
 
     if job_offset < 0 || job_limit <= 0 {
-        return Err(Error::InvalidArguments("job_offset must be >= 0 and job_limit must be > 0".to_string()));
+        return Err(Error::InvalidArguments(
+            "job_offset must be >= 0 and job_limit must be > 0".to_string(),
+        ));
     }
 
     let action_key = format!("action:{}", action_id);
 
     // Get action metadata
-    let plan_id_bytes = db.hget(&action_key, "plan_id")?
+    let plan_id_bytes = db
+        .hget(&action_key, "plan_id")?
         .ok_or_else(|| Error::InvalidArguments(format!("Action not found: {}", action_id)))?;
 
     let plan_id = String::from_utf8(plan_id_bytes)
         .map_err(|_| Error::Protocol("Invalid plan_id encoding".to_string()))?;
 
-    let status_bytes = db.hget(&action_key, "status")?
+    let status_bytes = db
+        .hget(&action_key, "status")?
         .unwrap_or_else(|| b"unknown".to_vec());
     let status = String::from_utf8(status_bytes)
         .map_err(|_| Error::Protocol("Invalid status encoding".to_string()))?;
@@ -2150,7 +2229,8 @@ fn handle_actions_get(args: &[RespValue], db: &Database) -> Result<RespValue> {
     let created_at = if let Some(bytes) = created_at_bytes {
         let ts_str = std::str::from_utf8(&bytes)
             .map_err(|_| Error::Protocol("Invalid timestamp encoding".to_string()))?;
-        ts_str.parse::<u64>()
+        ts_str
+            .parse::<u64>()
             .map_err(|_| Error::Protocol("Invalid timestamp format".to_string()))?
     } else {
         0
@@ -2159,7 +2239,8 @@ fn handle_actions_get(args: &[RespValue], db: &Database) -> Result<RespValue> {
     // Read cached job status counters (avoids N+1 query problem)
     // These counters are maintained by ACTION.SUBMIT and updated by workers
     let jobs_completed = if let Some(bytes) = db.hget(&action_key, "jobs_completed")? {
-        std::str::from_utf8(&bytes).ok()
+        std::str::from_utf8(&bytes)
+            .ok()
             .and_then(|s| s.parse::<u64>().ok())
             .unwrap_or(0)
     } else {
@@ -2167,7 +2248,8 @@ fn handle_actions_get(args: &[RespValue], db: &Database) -> Result<RespValue> {
     };
 
     let jobs_failed = if let Some(bytes) = db.hget(&action_key, "jobs_failed")? {
-        std::str::from_utf8(&bytes).ok()
+        std::str::from_utf8(&bytes)
+            .ok()
             .and_then(|s| s.parse::<u64>().ok())
             .unwrap_or(0)
     } else {
@@ -2175,7 +2257,8 @@ fn handle_actions_get(args: &[RespValue], db: &Database) -> Result<RespValue> {
     };
 
     let jobs_pending = if let Some(bytes) = db.hget(&action_key, "jobs_pending")? {
-        std::str::from_utf8(&bytes).ok()
+        std::str::from_utf8(&bytes)
+            .ok()
             .and_then(|s| s.parse::<u64>().ok())
             .unwrap_or(0)
     } else {
@@ -2188,7 +2271,8 @@ fn handle_actions_get(args: &[RespValue], db: &Database) -> Result<RespValue> {
 
     // Get paginated job list for job_ids array
     // Use checked arithmetic to prevent integer overflow
-    let job_stop = job_offset.checked_add(job_limit)
+    let job_stop = job_offset
+        .checked_add(job_limit)
         .and_then(|sum| sum.checked_sub(1))
         .ok_or_else(|| Error::InvalidArguments("Job pagination range overflow".to_string()))?;
     let job_ids_bytes = db.lrange(&action_jobs_key, job_offset, job_stop)?;
@@ -2221,8 +2305,15 @@ fn handle_actions_get(args: &[RespValue], db: &Database) -> Result<RespValue> {
     let response_json = serde_json::to_string(&response)
         .map_err(|_| Error::Protocol("Failed to serialize response".to_string()))?;
 
-    debug!("ACTION.GET {} -> {}/{} jobs (completed: {}, failed: {}, pending: {})",
-           action_id, job_ids.len(), jobs_total, jobs_completed, jobs_failed, jobs_pending);
+    debug!(
+        "ACTION.GET {} -> {}/{} jobs (completed: {}, failed: {}, pending: {})",
+        action_id,
+        job_ids.len(),
+        jobs_total,
+        jobs_completed,
+        jobs_failed,
+        jobs_pending
+    );
     Ok(RespValue::BulkString(response_json.into_bytes()))
 }
 
@@ -2250,14 +2341,17 @@ fn handle_jobs_list(args: &[RespValue], _db: &Database) -> Result<RespValue> {
     // Parse optional offset and limit arguments
     // Using u64 enforces non-negativity at type level
     let offset = if args.len() > 1 {
-        args[1].as_string()?.parse::<u64>()
-            .map_err(|_| Error::InvalidArguments("offset must be a non-negative integer".to_string()))?
+        args[1].as_string()?.parse::<u64>().map_err(|_| {
+            Error::InvalidArguments("offset must be a non-negative integer".to_string())
+        })?
     } else {
         0
     };
 
     let limit = if args.len() > 2 {
-        let requested = args[2].as_string()?.parse::<u64>()
+        let requested = args[2]
+            .as_string()?
+            .parse::<u64>()
             .map_err(|_| Error::InvalidArguments("limit must be a positive integer".to_string()))?;
         if requested == 0 {
             return Err(Error::InvalidArguments("limit must be > 0".to_string()));
@@ -2275,7 +2369,12 @@ fn handle_jobs_list(args: &[RespValue], _db: &Database) -> Result<RespValue> {
 
     let jobs: Vec<RespValue> = Vec::new();
 
-    debug!("JOBS.LIST -> {} jobs (offset: {}, limit: {})", jobs.len(), offset, limit);
+    debug!(
+        "JOBS.LIST -> {} jobs (offset: {}, limit: {})",
+        jobs.len(),
+        offset,
+        limit
+    );
     Ok(RespValue::Array(jobs))
 }
 
@@ -2325,14 +2424,16 @@ fn handle_job_get(args: &[RespValue], db: &Database) -> Result<RespValue> {
     let job_key = format!("job:{}", job_id);
 
     // Check if job exists
-    let plan_id_bytes = db.hget(&job_key, "plan_id")?
+    let plan_id_bytes = db
+        .hget(&job_key, "plan_id")?
         .ok_or_else(|| Error::InvalidArguments(format!("Job not found: {}", job_id)))?;
 
     let plan_id = String::from_utf8(plan_id_bytes)
         .map_err(|_| Error::Protocol("Invalid plan_id encoding".to_string()))?;
 
     // Get job metadata
-    let status_bytes = db.hget(&job_key, "status")?
+    let status_bytes = db
+        .hget(&job_key, "status")?
         .unwrap_or_else(|| b"unknown".to_vec());
     let status = String::from_utf8(status_bytes)
         .map_err(|_| Error::Protocol("Invalid status encoding".to_string()))?;
@@ -2341,14 +2442,16 @@ fn handle_job_get(args: &[RespValue], db: &Database) -> Result<RespValue> {
     let created_at = if let Some(bytes) = created_at_bytes {
         let ts_str = std::str::from_utf8(&bytes)
             .map_err(|_| Error::Protocol("Invalid timestamp encoding".to_string()))?;
-        ts_str.parse::<u64>()
+        ts_str
+            .parse::<u64>()
             .map_err(|_| Error::Protocol("Invalid timestamp format".to_string()))?
     } else {
         0
     };
 
     // Get input data (stored as JSON)
-    let input_bytes = db.hget(&job_key, "input")?
+    let input_bytes = db
+        .hget(&job_key, "input")?
         .unwrap_or_else(|| b"{}".to_vec());
     let input_str = std::str::from_utf8(&input_bytes)
         .map_err(|_| Error::Protocol("Invalid input encoding".to_string()))?;
@@ -2357,7 +2460,8 @@ fn handle_job_get(args: &[RespValue], db: &Database) -> Result<RespValue> {
 
     // Get input_index if it exists
     let input_index = if let Some(bytes) = db.hget(&job_key, "input_index")? {
-        std::str::from_utf8(&bytes).ok()
+        std::str::from_utf8(&bytes)
+            .ok()
             .and_then(|s| s.parse::<u64>().ok())
     } else {
         None
@@ -2379,13 +2483,137 @@ fn handle_job_get(args: &[RespValue], db: &Database) -> Result<RespValue> {
     let response_json = serde_json::to_string(&response)
         .map_err(|_| Error::Protocol("Failed to serialize response".to_string()))?;
 
-    debug!("JOB.GET {} -> plan_id: {}, status: {}", job_id, plan_id, status);
+    debug!(
+        "JOB.GET {} -> plan_id: {}, status: {}",
+        job_id, plan_id, status
+    );
     Ok(RespValue::BulkString(response_json.into_bytes()))
+}
+
+/// Register or update worker heartbeat
+///
+/// Creates/updates worker metadata with current timestamp and expiry time.
+///
+/// Storage structure:
+/// - Hash: `worker:<worker_id>` with fields: last_seen, status, expire_at
+/// - Sorted set: `workers:all` indexed by last_seen timestamp (for listing)
+/// - Workers expire after WORKER_HEARTBEAT_TTL_SECS (cleaned up on next WORKERS.LIST)
+///
+/// # Arguments
+/// * `db` - Database handle
+/// * `worker_id` - Worker identifier
+///
+/// # Security
+/// - worker_id is validated before calling (alphanumeric + hyphens/underscores)
+///
+/// # Errors
+/// Returns an error if database operations fail
+fn register_worker_heartbeat(db: &Database, worker_id: &str) -> Result<()> {
+    let worker_key = format!("worker:{}", worker_id);
+    let timestamp = get_current_timestamp_secs()?;
+
+    // Use checked arithmetic to prevent integer overflow
+    let expire_at = timestamp
+        .checked_add(WORKER_HEARTBEAT_TTL_SECS)
+        .ok_or_else(|| Error::Protocol("Worker TTL timestamp overflow".to_string()))?;
+
+    // Check if this is a new worker (not just an update)
+    let is_new_worker = !db.exists(&worker_key)?;
+
+    if is_new_worker {
+        // Security: Enforce maximum worker limit to prevent resource exhaustion
+        let current_worker_count = db.zcard("workers:all")?;
+        if current_worker_count >= MAX_WORKERS as u64 {
+            warn!(
+                "Maximum worker limit reached ({}/{}), rejecting new worker: {}",
+                current_worker_count, MAX_WORKERS, worker_id
+            );
+            return Err(Error::Protocol(format!(
+                "Maximum worker limit reached ({} workers). Cannot register new worker.",
+                MAX_WORKERS
+            )));
+        }
+    }
+
+    // Store worker metadata hash
+    db.hset(&worker_key, "last_seen", timestamp.to_string().as_bytes())?;
+    db.hset(&worker_key, "status", b"active")?;
+    db.hset(&worker_key, "expire_at", expire_at.to_string().as_bytes())?;
+
+    // Index worker in sorted set (for WORKERS.LIST)
+    // Score = last_seen timestamp for sorting by activity
+    db.zadd("workers:all", timestamp as f64, worker_id.as_bytes())?;
+
+    debug!(
+        "Worker {} heartbeat registered (expires at {})",
+        worker_id, expire_at
+    );
+
+    Ok(())
+}
+
+/// Clean up expired workers
+///
+/// Removes workers from workers:all sorted set if their expire_at timestamp has passed.
+/// This is called before listing workers to ensure stale workers don't appear.
+///
+/// # Arguments
+/// * `db` - Database handle
+///
+/// # Errors
+/// Returns an error if database operations fail
+fn cleanup_expired_workers(db: &Database) -> Result<()> {
+    let workers = db.zrange("workers:all", 0, -1)?;
+    let current_time = get_current_timestamp_secs()?;
+
+    for (worker_id_bytes, _score) in workers {
+        let worker_id = std::str::from_utf8(&worker_id_bytes)
+            .map_err(|_| Error::Protocol("Invalid worker_id encoding".to_string()))?;
+
+        let worker_key = format!("worker:{}", worker_id);
+
+        // Check expire_at field in worker hash
+        if let Some(expire_at_bytes) = db.hget(&worker_key, "expire_at")? {
+            // Parse expire_at with proper error handling (no silent failures)
+            let expire_at_str = std::str::from_utf8(&expire_at_bytes).map_err(|e| {
+                Error::Protocol(format!(
+                    "Worker {} has invalid UTF-8 in expire_at: {}",
+                    worker_id, e
+                ))
+            })?;
+
+            let expire_at = expire_at_str.parse::<u64>().map_err(|e| {
+                Error::Protocol(format!(
+                    "Worker {} has invalid expire_at timestamp '{}': {}",
+                    worker_id, expire_at_str, e
+                ))
+            })?;
+
+            if current_time >= expire_at {
+                // Expired - remove worker
+                debug!("Removing expired worker: {}", worker_id);
+                db.zrem("workers:all", &worker_id_bytes)?;
+                db.del(&worker_key)?;
+            }
+        } else {
+            // No expire_at field - corrupted data, log warning and remove
+            warn!(
+                "Worker {} missing expire_at field - removing corrupted entry",
+                worker_id
+            );
+            db.zrem("workers:all", &worker_id_bytes)?;
+            db.del(&worker_key)?;
+        }
+    }
+
+    Ok(())
 }
 
 /// Handle WORKERS.LIST command
 ///
-/// Returns array of worker IDs currently registered with AGQ.
+/// Returns array of worker objects with metadata (worker_id, last_seen, status, tools).
+///
+/// Workers are tracked via PING heartbeats and auto-expire after WORKER_HEARTBEAT_TTL_SECS.
 ///
 /// # Security
 /// - Requires authentication
@@ -2394,20 +2622,77 @@ fn handle_job_get(args: &[RespValue], db: &Database) -> Result<RespValue> {
 /// * `args` - RESP arguments: [command]
 /// * `db` - Database handle
 ///
-/// # Note
-/// AGQ doesn't currently track workers (AGW connects directly to pull jobs).
-/// This is a placeholder that returns empty array until worker registration is implemented.
-fn handle_workers_list(_args: &[RespValue], _db: &Database) -> Result<RespValue> {
-    // NOTE: AGQ currently doesn't track workers
-    // Workers connect via BRPOP and don't register themselves
-    // This is a placeholder implementation that returns empty array
-    // TODO(#43): When worker registration is added, implement proper listing
-    // See: https://github.com/agenix-sh/agq/issues/43#future-work
+/// # Returns
+/// Array of worker objects sorted by last_seen (most recent first):
+/// ```json
+/// [
+///   {
+///     "worker_id": "worker_abc123",
+///     "last_seen": 1700000000,
+///     "status": "active",
+///     "tools": "grep,sort,uniq"
+///   }
+/// ]
+/// ```
+fn handle_workers_list(_args: &[RespValue], db: &Database) -> Result<RespValue> {
+    // Clean up expired workers first
+    cleanup_expired_workers(db)?;
 
-    let workers: Vec<RespValue> = Vec::new();
+    // Get all workers from sorted set (sorted by last_seen, descending)
+    let workers = db.zrange("workers:all", 0, -1)?;
 
-    debug!("WORKERS.LIST -> {} workers", workers.len());
-    Ok(RespValue::Array(workers))
+    let mut worker_objects = Vec::new();
+
+    for (worker_id_bytes, _score) in workers.iter().rev() {
+        // Reverse to show most recent first
+        let worker_id = std::str::from_utf8(worker_id_bytes)
+            .map_err(|_| Error::Protocol("Invalid worker_id encoding".to_string()))?;
+
+        let worker_key = format!("worker:{}", worker_id);
+
+        // Get worker metadata
+        let last_seen_bytes = db.hget(&worker_key, "last_seen")?;
+        let status_bytes = db.hget(&worker_key, "status")?;
+
+        if let (Some(last_seen), Some(status)) = (last_seen_bytes, status_bytes) {
+            let last_seen_str = std::str::from_utf8(&last_seen)
+                .map_err(|_| Error::Protocol("Invalid last_seen encoding".to_string()))?;
+            let status_str = std::str::from_utf8(&status)
+                .map_err(|_| Error::Protocol("Invalid status encoding".to_string()))?;
+
+            // Get tools (optional field)
+            let tools_key = format!("worker:{}:tools", worker_id);
+            let tools = db.get(&tools_key)?;
+            let tools_str = tools
+                .as_ref()
+                .and_then(|t| std::str::from_utf8(t).ok())
+                .unwrap_or("");
+
+            // Parse last_seen with proper error handling
+            let last_seen_timestamp = last_seen_str.parse::<u64>().map_err(|e| {
+                Error::Protocol(format!(
+                    "Worker {} has invalid last_seen timestamp '{}': {}",
+                    worker_id, last_seen_str, e
+                ))
+            })?;
+
+            // Build worker object as JSON
+            let worker_obj = serde_json::json!({
+                "worker_id": worker_id,
+                "last_seen": last_seen_timestamp,
+                "status": status_str,
+                "tools": tools_str
+            });
+
+            let worker_json = serde_json::to_string(&worker_obj)
+                .map_err(|_| Error::Protocol("Failed to serialize worker object".to_string()))?;
+
+            worker_objects.push(RespValue::BulkString(worker_json.into_bytes()));
+        }
+    }
+
+    debug!("WORKERS.LIST -> {} workers", worker_objects.len());
+    Ok(RespValue::Array(worker_objects))
 }
 
 /// Handle QUEUE.STATS command
@@ -2446,7 +2731,10 @@ fn handle_queue_stats(_args: &[RespValue], db: &Database) -> Result<RespValue> {
         RespValue::BulkString(scheduled_jobs.to_string().into_bytes()),
     ];
 
-    debug!("QUEUE.STATS -> pending: {}, scheduled: {}", pending_jobs, scheduled_jobs);
+    debug!(
+        "QUEUE.STATS -> pending: {}, scheduled: {}",
+        pending_jobs, scheduled_jobs
+    );
     Ok(RespValue::Array(stats))
 }
 
@@ -2547,34 +2835,43 @@ mod tests {
 
     #[tokio::test]
     async fn test_ping_handler_simple() {
+        let (db, _temp) = test_db();
         let args = vec![RespValue::BulkString(b"PING".to_vec())];
 
-        let result = handle_ping(&args).unwrap();
+        let result = handle_ping(&args, &db).unwrap();
 
         assert_eq!(result, RespValue::SimpleString("PONG".to_string()));
     }
 
     #[tokio::test]
-    async fn test_ping_handler_with_message() {
+    async fn test_ping_handler_with_worker_id() {
+        let (db, _temp) = test_db();
         let args = vec![
             RespValue::BulkString(b"PING".to_vec()),
-            RespValue::BulkString(b"hello".to_vec()),
+            RespValue::BulkString(b"worker_test123".to_vec()),
         ];
 
-        let result = handle_ping(&args).unwrap();
+        let result = handle_ping(&args, &db).unwrap();
 
-        assert_eq!(result, RespValue::BulkString(b"hello".to_vec()));
+        // Should echo back worker_id
+        assert_eq!(result, RespValue::BulkString(b"worker_test123".to_vec()));
+
+        // Verify worker was registered
+        let workers = db.zrange("workers:all", 0, -1).unwrap();
+        assert_eq!(workers.len(), 1);
+        assert_eq!(workers[0].0, b"worker_test123");
     }
 
     #[tokio::test]
     async fn test_ping_handler_too_many_args() {
+        let (db, _temp) = test_db();
         let args = vec![
             RespValue::BulkString(b"PING".to_vec()),
             RespValue::BulkString(b"arg1".to_vec()),
             RespValue::BulkString(b"arg2".to_vec()),
         ];
 
-        let result = handle_ping(&args);
+        let result = handle_ping(&args, &db);
 
         assert!(result.is_err());
     }
