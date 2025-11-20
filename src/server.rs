@@ -473,6 +473,28 @@ fn handle_auth(
 /// without immediately marking workers as stale.
 const WORKER_HEARTBEAT_TTL_SECS: u64 = 300;
 
+/// Maximum number of workers allowed
+///
+/// Prevents resource exhaustion attacks where an attacker creates unlimited workers.
+/// Even with TTL, an attacker could maintain 10,000+ active workers by sending
+/// heartbeats every 60 seconds. This limit caps the total number of registered workers.
+const MAX_WORKERS: usize = 1000;
+
+/// Rate limiter for worker heartbeat registration (PING with worker_id)
+///
+/// Prevents DoS attacks via rapid worker creation.
+/// Limit: 1000 heartbeats per minute (reasonable for legitimate usage)
+///
+/// Legitimate scenario: 100 workers × 1 heartbeat/minute = 100 req/min
+/// This limit provides 10x headroom for burst traffic and misconfiguration.
+static WORKER_HEARTBEAT_LIMITER: Lazy<
+    governor::RateLimiter<
+        governor::state::direct::NotKeyed,
+        governor::state::InMemoryState,
+        governor::clock::DefaultClock,
+    >,
+> = Lazy::new(|| governor::RateLimiter::direct(Quota::per_minute(NonZeroU32::new(1000).unwrap())));
+
 fn handle_ping(args: &[RespValue], db: &Database) -> Result<RespValue> {
     match args.len() {
         1 => {
@@ -481,6 +503,14 @@ fn handle_ping(args: &[RespValue], db: &Database) -> Result<RespValue> {
         }
         2 => {
             // PING with worker_id - treat as heartbeat
+            // Security: Check rate limit to prevent DoS via rapid worker creation
+            if WORKER_HEARTBEAT_LIMITER.check().is_err() {
+                warn!("Worker heartbeat rate limit exceeded");
+                return Err(Error::Protocol(
+                    "Rate limit exceeded for worker heartbeats (max 1000/minute)".to_string(),
+                ));
+            }
+
             let worker_id = args[1].as_string()?;
 
             // Validate worker_id
@@ -2481,7 +2511,29 @@ fn handle_job_get(args: &[RespValue], db: &Database) -> Result<RespValue> {
 fn register_worker_heartbeat(db: &Database, worker_id: &str) -> Result<()> {
     let worker_key = format!("worker:{}", worker_id);
     let timestamp = get_current_timestamp_secs()?;
-    let expire_at = timestamp + WORKER_HEARTBEAT_TTL_SECS;
+
+    // Use checked arithmetic to prevent integer overflow
+    let expire_at = timestamp
+        .checked_add(WORKER_HEARTBEAT_TTL_SECS)
+        .ok_or_else(|| Error::Protocol("Worker TTL timestamp overflow".to_string()))?;
+
+    // Check if this is a new worker (not just an update)
+    let is_new_worker = !db.exists(&worker_key)?;
+
+    if is_new_worker {
+        // Security: Enforce maximum worker limit to prevent resource exhaustion
+        let current_worker_count = db.zcard("workers:all")?;
+        if current_worker_count >= MAX_WORKERS as u64 {
+            warn!(
+                "Maximum worker limit reached ({}/{}), rejecting new worker: {}",
+                current_worker_count, MAX_WORKERS, worker_id
+            );
+            return Err(Error::Protocol(format!(
+                "Maximum worker limit reached ({} workers). Cannot register new worker.",
+                MAX_WORKERS
+            )));
+        }
+    }
 
     // Store worker metadata hash
     db.hset(&worker_key, "last_seen", timestamp.to_string().as_bytes())?;
@@ -2522,20 +2574,33 @@ fn cleanup_expired_workers(db: &Database) -> Result<()> {
 
         // Check expire_at field in worker hash
         if let Some(expire_at_bytes) = db.hget(&worker_key, "expire_at")? {
-            if let Ok(expire_at_str) = std::str::from_utf8(&expire_at_bytes) {
-                if let Ok(expire_at) = expire_at_str.parse::<u64>() {
-                    if current_time >= expire_at {
-                        // Expired - remove worker
-                        debug!("Removing expired worker: {}", worker_id);
+            // Parse expire_at with proper error handling (no silent failures)
+            let expire_at_str = std::str::from_utf8(&expire_at_bytes).map_err(|e| {
+                Error::Protocol(format!(
+                    "Worker {} has invalid UTF-8 in expire_at: {}",
+                    worker_id, e
+                ))
+            })?;
 
-                        db.zrem("workers:all", &worker_id_bytes)?;
-                        db.del(&worker_key)?;
-                    }
-                }
+            let expire_at = expire_at_str.parse::<u64>().map_err(|e| {
+                Error::Protocol(format!(
+                    "Worker {} has invalid expire_at timestamp '{}': {}",
+                    worker_id, expire_at_str, e
+                ))
+            })?;
+
+            if current_time >= expire_at {
+                // Expired - remove worker
+                debug!("Removing expired worker: {}", worker_id);
+                db.zrem("workers:all", &worker_id_bytes)?;
+                db.del(&worker_key)?;
             }
         } else {
-            // No expire_at field - remove (corrupted data)
-            debug!("Removing worker with missing expire_at: {}", worker_id);
+            // No expire_at field - corrupted data, log warning and remove
+            warn!(
+                "Worker {} missing expire_at field - removing corrupted entry",
+                worker_id
+            );
             db.zrem("workers:all", &worker_id_bytes)?;
             db.del(&worker_key)?;
         }
@@ -2603,10 +2668,18 @@ fn handle_workers_list(_args: &[RespValue], db: &Database) -> Result<RespValue> 
                 .and_then(|t| std::str::from_utf8(t).ok())
                 .unwrap_or("");
 
+            // Parse last_seen with proper error handling
+            let last_seen_timestamp = last_seen_str.parse::<u64>().map_err(|e| {
+                Error::Protocol(format!(
+                    "Worker {} has invalid last_seen timestamp '{}': {}",
+                    worker_id, last_seen_str, e
+                ))
+            })?;
+
             // Build worker object as JSON
             let worker_obj = serde_json::json!({
                 "worker_id": worker_id,
-                "last_seen": last_seen_str.parse::<u64>().unwrap_or(0),
+                "last_seen": last_seen_timestamp,
                 "status": status_str,
                 "tools": tools_str
             });
